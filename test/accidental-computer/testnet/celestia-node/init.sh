@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-CHAIN_ID="celestia-zkevm-testnet"
+CHAIN_ID="celestia-zkevm"
 CONSENSUS_RPC="http://celestia-validator:26657/status"
 MNEMONIC="father remove minimum call daughter fly runway sponsor two exile bean sting address person hidden view want black strong text fashion ethics nephew reform"
 

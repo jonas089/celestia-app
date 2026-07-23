@@ -125,12 +125,16 @@ struct BlockRecord {
     error: String,
     tx_hash: String, // fibre MsgPayForFibre tx hash (fibre mode only)
     blob_id: String, // fibre blob id (fibre mode only)
+    program_name: String, // sample program name (e.g. "sum_1_to_n")
+    rust_source: String,  // simple no_std Rust source the program was compiled from
 }
 impl BlockRecord {
     fn to_json(&self) -> Value {
         json!({
             "kind": "rv32",
             "blockNumber": self.height,
+            "programName": self.program_name,
+            "rustSource": self.rust_source,
             "status": self.status,
             "verified": self.verified,
             "commitment": self.commitment,
@@ -159,6 +163,10 @@ struct Submission {
     /// state). A program's store targets (e.g. an output slot 0x200) must be
     /// declared here since the in-circuit memory is a bounded committed set.
     mem: Vec<(u32, u32)>,
+    /// Human name and the simple no_std Rust source the program was compiled
+    /// from (both optional; surfaced in the explorer).
+    name: String,
+    source: String,
 }
 
 type Cache = Arc<Mutex<BTreeMap<u64, BlockRecord>>>;
@@ -464,6 +472,7 @@ fn block_worker(rx: std::sync::mpsc::Receiver<Submission>, cache: Cache) {
                     output: String::new(), post_state_root: String::new(), num_cycles: 0, input_vars: 0,
                     proof_bytes: 0, elapsed_ms: 0, submitted_unix: submitted, proved_unix: 0, error: String::new(),
                     tx_hash: String::new(), blob_id: String::new(),
+                    program_name: sub.name.clone(), rust_source: sub.source.clone(),
                 });
             }
             eprintln!("rv32-rollup: block #{h}: executing + proving ({} instrs, {} input bytes)", sub.program.len(), sub.input.len());
@@ -472,6 +481,14 @@ fn block_worker(rx: std::sync::mpsc::Receiver<Submission>, cache: Cache) {
             // pre_mem = persistent state slots merged with this submission's
             // declared slots (submission overrides persistent on address clash).
             let mut merged: BTreeMap<u32, u32> = state.mem.clone();
+            // The input region [0x100, 0x100+len) is per-block scratch, not
+            // persistent state. Drop any carried slots the input words will
+            // occupy so the prover's committed slots don't duplicate address
+            // 0x100.. and diverge from the native emulator (the carried-state bug).
+            let in_words = ((sub.input.len() + 3) / 4) as u32;
+            for k in 0..in_words {
+                merged.remove(&(0x100 + 4 * k));
+            }
             for (a, v) in &sub.mem {
                 merged.insert(*a, *v);
             }
@@ -602,7 +619,9 @@ fn handle_body(body: &[u8], cache: &Cache, tx: &Sender<Submission>) -> String {
                     }
                 }
             }
-            let _ = tx.send(Submission { program: prog, input, mem });
+            let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let source = p.get("source").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let _ = tx.send(Submission { program: prog, input, mem, name, source });
             json!({"jsonrpc":"2.0","id":id,"result":{"status":"queued"}}).to_string()
         }
         "accProof_listBlockProofs" => {
@@ -643,54 +662,82 @@ fn write_http(stream: &mut TcpStream, status: &str, body: &str) -> std::io::Resu
     stream.write_all(resp.as_bytes())
 }
 
-/// A few ready-to-submit sample rv32i programs (assembled with the emulator's
-/// helpers), used by the submitter and for smoke tests. Each: (name, program,
-/// input bytes, memory slots to declare). Input words load at 0x100; output at 0x200.
-fn samples() -> Vec<(&'static str, Vec<u32>, Vec<u8>, Vec<(u32, u32)>)> {
-    use riscv_stf::emulator::{add, addi, bge, jal, lw, sw};
-    // (a) sum 1..=n, n from the input word, result -> mem[0x200].
+// Sample programs are simple #![no_std] Rust, compiled to rv32im
+// (riscv32im-unknown-none-elf, opt-level=3) with no stack usage. The compiled
+// instruction words are embedded below; the exact source that produced them is
+// carried alongside so the explorer can show source + bytecode + proof. See
+// programs/*.rs and programs/README.md to regenerate.
+
+const SRC_SUM: &str = r#"#![no_std]
+#![no_main]
+
+// sum 1..=n : n is read from mem[0x100], result written to mem[0x200].
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    let n = unsafe { core::ptr::read_volatile(0x100 as *const u32) };
+    let mut acc: u32 = 0;
+    let mut i: u32 = 1;
+    while i <= n {
+        acc = acc.wrapping_add(i);
+        i += 1;
+    }
+    unsafe { core::ptr::write_volatile(0x200 as *mut u32, acc) };
+    loop {}
+}
+"#;
+
+const SRC_ADD: &str = r#"#![no_std]
+#![no_main]
+
+// add : mem[0x100] + mem[0x104] -> mem[0x200].
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    let a = unsafe { core::ptr::read_volatile(0x100 as *const u32) };
+    let b = unsafe { core::ptr::read_volatile(0x104 as *const u32) };
+    unsafe { core::ptr::write_volatile(0x200 as *mut u32, a.wrapping_add(b)) };
+    loop {}
+}
+"#;
+
+const SRC_INC: &str = r#"#![no_std]
+#![no_main]
+
+// increment : a persistent counter at mem[0x200] (carried block to block).
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    let c = unsafe { core::ptr::read_volatile(0x200 as *const u32) };
+    unsafe { core::ptr::write_volatile(0x200 as *mut u32, c.wrapping_add(1)) };
+    loop {}
+}
+"#;
+
+/// The sample programs as (name, compiled rv32im words, input bytes, declared
+/// memory slots, Rust source). The words are real rustc output for the source
+/// shown (stack-free; input at 0x100/0x104, output at 0x200).
+fn samples() -> Vec<(&'static str, Vec<u32>, Vec<u8>, Vec<(u32, u32)>, &'static str)> {
     let sum = vec![
-        addi(1, 0, 0),          // x1 = 0 (acc)
-        addi(2, 0, 1),          // x2 = 1 (i)
-        lw(3, 0, 0x100),        // x3 = n
-        add(1, 1, 2),           // acc += i
-        addi(2, 2, 1),          // i += 1
-        bge(3, 2, -8),          // if n >= i loop back to add
-        sw(1, 0, 0x200),        // mem[0x200] = acc
-        jal(0, 0),              // halt
+        0x10002583, 0x00058e63, 0x00000513, 0x00100613, 0x00c50533, 0x00160613,
+        0xfec5fce3, 0x0080006f, 0x00000513, 0x20a02023, 0x0000006f,
     ];
-    // (b) load-add-store: mem[0x100]+mem[0x104] -> mem[0x200].
-    let addst = vec![
-        lw(1, 0, 0x100),
-        lw(2, 0, 0x104),
-        add(3, 1, 2),
-        sw(3, 0, 0x200),
-        jal(0, 0),
-    ];
-    // (c) increment a persistent counter at mem[0x200] (shows stateful carry-over).
-    let inc = vec![
-        lw(1, 0, 0x200),
-        addi(1, 1, 1),
-        sw(1, 0, 0x200),
-        jal(0, 0),
-    ];
+    let addst = vec![0x10002503, 0x10402583, 0x00a58533, 0x20a02023, 0x0000006f];
+    let inc = vec![0x20002503, 0x00150513, 0x20a02023, 0x0000006f];
     vec![
-        ("sum_1_to_n", sum, 3u32.to_le_bytes().to_vec(), vec![(0x200, 0)]),
+        ("sum_1_to_n", sum, 3u32.to_le_bytes().to_vec(), vec![(0x200, 0)], SRC_SUM),
         ("add", addst, {
             let mut v = 7u32.to_le_bytes().to_vec();
             v.extend_from_slice(&35u32.to_le_bytes());
             v
-        }, vec![(0x200, 0)]),
-        ("increment", inc, vec![], vec![(0x200, 0)]),
+        }, vec![(0x200, 0)], SRC_ADD),
+        ("increment", inc, vec![], vec![(0x200, 0)], SRC_INC),
     ]
 }
 
 fn main() {
     // `rv32-rollup emit-sample` prints ready-to-submit JSON for the sample programs.
     if std::env::args().any(|a| a == "emit-sample") {
-        for (name, prog, input, mem) in samples() {
+        for (name, prog, input, mem, source) in samples() {
             let memj: Vec<Value> = mem.iter().map(|(a, v)| json!([a, v])).collect();
-            let sub = json!({"name":name,"program":hexs(&words_le(&prog)),"input":hexs(&input),"mem":memj});
+            let sub = json!({"name":name,"program":hexs(&words_le(&prog)),"input":hexs(&input),"mem":memj,"source":source});
             println!("{sub}");
         }
         return;
