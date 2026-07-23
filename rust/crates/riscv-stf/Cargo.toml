@@ -1,7 +1,7 @@
 # RV32IM CPU-verifier as an Expander GKR circuit, proven with rsema1d as the
-# INPUT polynomial commitment. Mirrors stf-circuit's proving spine (ECC frontend
-# over GF2 -> export_to_expander_flatten -> executor::prove::<Rsema1dGKRConfig> ->
-# verify -> commitment == independent Go/DA rsema1d commit).
+# INPUT polynomial commitment: export_to_expander_flatten ->
+# executor::prove::<Rsema1dGKRConfig> -> verify -> commitment == the on-DA
+# rsema1d commitment. Consumed as a library by the rv32-rollup crate.
 #
 # Own [workspace] => own Cargo.lock, detached from the parent rust/ workspace.
 [workspace]
@@ -15,58 +15,6 @@ edition = "2021"
 name = "riscv_stf"
 path = "src/lib.rs"
 
-[[bin]]
-name = "riscv_pipeline"
-path = "src/main.rs"
-
-[[bin]]
-name = "riscv_pipeline_full"
-path = "src/main_full.rs"
-
-[[bin]]
-name = "gf128_test"
-path = "src/main_gf128_test.rs"
-
-[[bin]]
-name = "riscv_pipeline_gp"
-path = "src/main_gp.rs"
-
-[[bin]]
-name = "prove_block_stf"
-path = "src/main_stf.rs"
-
-[[bin]]
-name = "evm_emu"
-path = "src/main_evm_emu.rs"
-
-[[bin]]
-name = "prove_evm"
-path = "src/main_evm.rs"
-
-[[bin]]
-name = "prove_isa"
-path = "src/main_isa.rs"
-
-[[bin]]
-name = "prove_stf_ac"
-path = "src/main_ac.rs"
-
-[[bin]]
-name = "prove_batch_keccak"
-path = "src/main_batch_keccak.rs"
-
-[[bin]]
-name = "prove_stf_transfer"
-path = "src/main_stf_transfer.rs"
-
-[[bin]]
-name = "prove_stf_full"
-path = "src/main_stf_full.rs"
-
-[[bin]]
-name = "measure"
-path = "src/main_measure.rs"
-
 [dependencies]
 expander_compiler = { git = "https://github.com/jonas089/ExpanderCompilerCollection.git", branch = "jonas/accidental-computer", package = "expander_compiler" }
 expander_binary = { git = "https://github.com/PolyhedraZK/Expander", branch = "main", package = "bin" }
@@ -77,8 +25,6 @@ gf2_128 = { git = "https://github.com/PolyhedraZK/Expander", branch = "main" }
 arith = { git = "https://github.com/PolyhedraZK/Expander", branch = "main" }
 polynomials = { git = "https://github.com/PolyhedraZK/Expander", branch = "main" }
 serdes = { git = "https://github.com/PolyhedraZK/Expander", branch = "main", package = "serdes" }
-# Expander's STOCK polynomial-commitment crate + FS transcript, for committing the
-# EXECUTION TRACE input layer via RawExpanderGKR<GF2ExtConfig> (no rsema1d).
 poly_commit = { git = "https://github.com/PolyhedraZK/Expander", branch = "main" }
 gkr_hashers = { git = "https://github.com/PolyhedraZK/Expander", branch = "main" }
 transcript = { git = "https://github.com/PolyhedraZK/Expander", branch = "main" }
@@ -87,8 +33,6 @@ rsema1d-sys = { path = "../rsema1d-sys" }
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 num-bigint = "0.4"
 num-traits = "0.2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 
 [profile.release]
 opt-level = 3
@@ -114,23 +58,3 @@ gkr_hashers = { path = "../../vendor/expander/hasher" }
 utils = { path = "../../vendor/expander/utils" }
 config_macros = { path = "../../vendor/expander/config_macros" }
 serdes_derive = { path = "../../vendor/expander/serdes_derive" }
-
-[[bin]]
-name = "prove_evm_exec"
-path = "src/main_prove_evm.rs"
-
-[[bin]]
-name = "prove_block"
-path = "src/main_prove_block.rs"
-
-[[bin]]
-name = "da_encode_block"
-path = "src/main_da_encode.rs"
-
-[[bin]]
-name = "prove_block_handoff"
-path = "src/main_prove_handoff.rs"
-
-[[bin]]
-name = "prove_real_block"
-path = "src/main_prove_real_block.rs"

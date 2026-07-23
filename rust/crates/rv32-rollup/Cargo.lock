@@ -2279,8 +2279,6 @@ dependencies = [
  "polynomials",
  "rsema1d-pcs",
  "rsema1d-sys",
- "serde",
- "serde_json",
  "serdes",
  "tiny-keccak",
  "transcript",
@@ -2347,6 +2345,7 @@ dependencies = [
  "libc",
  "riscv-stf",
  "serde_json",
+ "tiny-keccak",
 ]
 
 [[package]]

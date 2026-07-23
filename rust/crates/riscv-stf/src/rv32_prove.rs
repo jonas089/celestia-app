@@ -29,7 +29,20 @@ const PROG_LEN: usize = 16; // committed program words
 const NREG: usize = 32; // RV32I register file
 const MEM_SLOTS: usize = 8; // bounded word-memory slots (input region + user + pad)
 const WADDR_BITS: usize = 16; // committed word-address width
-const STEPS: usize = 16; // unrolled interpreter steps
+const STEPS: usize = 16; // unrolled interpreter steps (rollup default)
+
+/// Unrolled interpreter step count. Defaults to STEPS (the rollup's fixed 16);
+/// overridable via the RV32_STEPS env var for the gas-ceiling benchmark, which
+/// proves progressively larger circuits on the standalone path. Read once per
+/// prepare (before circuit compile), so the native emulator and the compiled
+/// circuit agree on the unroll depth.
+fn steps() -> usize {
+    std::env::var("RV32_STEPS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&s| s >= 1)
+        .unwrap_or(STEPS)
+}
 const INPUT_ADDR: u32 = 0x100; // byte address where the input region is loaded
 
 declare_circuit!(Rv32Circuit {
@@ -59,7 +72,7 @@ impl Define<GF2Config> for Rv32Circuit<Variable> {
         let pc = vec![api.constant(0); 32];
         let st = Rv32State { regs, pc, mem_addr, mem_val };
         // Every wire produced here is INTERMEDIATE (pinned by sumcheck, uncommitted).
-        let fin = run(api, st, &program, &cfg, STEPS);
+        let fin = run(api, st, &program, &cfg, steps());
         for i in 0..NREG {
             for b in 0..32 {
                 api.assert_is_equal(fin.regs[i][b], self.post_regs[i][b]);
@@ -110,7 +123,17 @@ fn regs_root(regs: &[u32; 32]) -> [u8; 32] {
     for i in 0..NREG {
         buf[i * 4..i * 4 + 4].copy_from_slice(&regs[i].to_le_bytes());
     }
-    crate::mpt::keccak256(&buf)
+    keccak256_native(&buf)
+}
+
+/// Native keccak256 (matches the in-circuit `keccak256_fixed` gadget).
+fn keccak256_native(b: &[u8]) -> [u8; 32] {
+    use tiny_keccak::{Hasher, Keccak};
+    let mut k = Keccak::v256();
+    k.update(b);
+    let mut out = [0u8; 32];
+    k.finalize(&mut out);
+    out
 }
 
 pub struct Rv32Proof {
@@ -230,7 +253,7 @@ pub fn rv32_prepare(
     for &(a, v) in &slots {
         cpu.mem.store(a, v);
     }
-    let trace = cpu.run(STEPS);
+    let trace = cpu.run(steps());
     // SOUNDNESS: the circuit models memory as exactly the committed MEM_SLOTS.
     // A store to a word address that is NOT one of those slots is silently
     // dropped by the in-circuit STF (no slot's `hit` fires), yet post_mem only
@@ -256,7 +279,7 @@ pub fn rv32_prepare(
         .iter()
         .find(|r| r.next_pc == r.pc)
         .map(|r| r.cycle + 1)
-        .unwrap_or(STEPS as u32);
+        .unwrap_or(steps() as u32);
     let mut output = Vec::new();
     for k in 0..n_user {
         let v = post_mem_full[n_input + k].1;

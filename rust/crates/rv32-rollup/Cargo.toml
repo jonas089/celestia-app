@@ -7,6 +7,7 @@ description = "Minimal rv32i sovereign rollup on Celestia: raw rv32i execution, 
 [dependencies]
 riscv-stf = { path = "../riscv-stf" }
 serde_json = "1"
+tiny-keccak = { version = "2.0", features = ["keccak"] }
 # Pin libc to match the prover crates (0.2.187+ dropped MADV_HUGEPAGE on macOS,
 # which the vendored Expander `circuit` crate uses unguarded).
 libc = "=0.2.186"

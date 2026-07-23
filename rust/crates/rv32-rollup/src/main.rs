@@ -186,7 +186,16 @@ fn state_digest(regs: &[u32; 32], mem: &BTreeMap<u32, u32>) -> [u8; 32] {
         buf.extend_from_slice(&a.to_be_bytes());
         buf.extend_from_slice(&v.to_be_bytes());
     }
-    riscv_stf::mpt::keccak256(&buf)
+    keccak256(&buf)
+}
+
+fn keccak256(b: &[u8]) -> [u8; 32] {
+    use tiny_keccak::{Hasher, Keccak};
+    let mut k = Keccak::v256();
+    k.update(b);
+    let mut out = [0u8; 32];
+    k.finalize(&mut out);
+    out
 }
 
 // --------------------------------------------------------------------------
