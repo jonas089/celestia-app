@@ -1,0 +1,15 @@
+# Genuine minimal EVM interpreter (pure Rust, ZERO dependencies).
+#
+# 256-bit words as 8x u32 little-endian limbs, a real opcode dispatch loop with
+# stack / memory / storage / gas, correct EVM semantics for the supported opcode
+# subset. No deps so it compiles unchanged both inside the detached `riscv-stf`
+# workspace (as the proof's native reference) and in the parent workspace (where
+# `evm-xcheck` cross-checks it against revm).
+[package]
+name = "evm-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "evm_core"
+path = "src/lib.rs"

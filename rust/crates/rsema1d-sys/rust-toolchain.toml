@@ -1,0 +1,4 @@
+# Pin to the stable toolchain (cargo 1.96) rather than inheriting the 1.88.0
+# override that rust/rust-toolchain.toml imposes on the rest of the tree.
+[toolchain]
+channel = "stable"

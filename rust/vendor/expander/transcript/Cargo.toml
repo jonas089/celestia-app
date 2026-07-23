@@ -1,0 +1,19 @@
+[package]
+name = "transcript"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arith = { path = "../arith" }
+gkr_hashers = { path = "../hasher" }
+gkr_engine = { path = "../gkr_engine" }
+serdes = { path = "../serdes" }
+
+sha2.workspace = true
+tiny-keccak.workspace = true
+
+[dev-dependencies]
+mersenne31 = { path = "../arith/mersenne31/" }
+
+[features]
+recursion = []

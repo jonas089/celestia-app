@@ -1,0 +1,39 @@
+[package]
+name = "rv32-rollup"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal rv32i sovereign rollup on Celestia: raw rv32i execution, program+input+output+trace+state posted to DA, GKR-proven by reusing the rsema1d/DA commitment (the accidental rv32i computer). No permissioning, no tokens."
+
+[dependencies]
+riscv-stf = { path = "../riscv-stf" }
+serde_json = "1"
+# Pin libc to match the prover crates (0.2.187+ dropped MADV_HUGEPAGE on macOS,
+# which the vendored Expander `circuit` crate uses unguarded).
+libc = "=0.2.186"
+
+[[bin]]
+name = "rv32-rollup"
+path = "src/main.rs"
+
+[patch."https://github.com/PolyhedraZK/Expander"]
+arith = { path = "../../vendor/expander/arith" }
+babybear = { path = "../../vendor/expander/arith/babybear" }
+crosslayer_prototype = { path = "../../vendor/expander/crosslayer_prototype" }
+circuit = { path = "../../vendor/expander/circuit" }
+transcript = { path = "../../vendor/expander/transcript" }
+bin = { path = "../../vendor/expander/bin" }
+gkr = { path = "../../vendor/expander/gkr" }
+gf2 = { path = "../../vendor/expander/arith/gf2" }
+gf2_128 = { path = "../../vendor/expander/arith/gf2_128" }
+mersenne31 = { path = "../../vendor/expander/arith/mersenne31" }
+goldilocks = { path = "../../vendor/expander/arith/goldilocks" }
+poly_commit = { path = "../../vendor/expander/poly_commit" }
+polynomials = { path = "../../vendor/expander/arith/polynomials" }
+sumcheck = { path = "../../vendor/expander/sumcheck" }
+serdes = { path = "../../vendor/expander/serdes" }
+gkr_engine = { path = "../../vendor/expander/gkr_engine" }
+gkr_hashers = { path = "../../vendor/expander/hasher" }
+utils = { path = "../../vendor/expander/utils" }
+config_macros = { path = "../../vendor/expander/config_macros" }
+serdes_derive = { path = "../../vendor/expander/serdes_derive" }
+

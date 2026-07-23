@@ -1,0 +1,4 @@
+# Expander's vendored crates require this exact nightly (see
+# rust/vendor/expander/rust-toolchain).
+[toolchain]
+channel = "nightly-2025-05-17"

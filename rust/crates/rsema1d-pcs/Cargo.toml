@@ -1,0 +1,28 @@
+[package]
+name = "rsema1d-pcs"
+version = "0.1.0"
+edition = "2021"
+description = "Polyhedra Expander input polynomial-commitment backed by the real Go rsema1d multilinear PCS — the accidental-computer input-commitment reuse for GKR."
+
+# Own workspace root so this crate keeps its own Cargo.lock and does not join
+# the existing rust/ workspace or Expander's vendored workspace.
+[workspace]
+
+[dependencies]
+# Vendored Polyhedra Expander crates (path deps into rust/vendor/expander).
+gkr_engine = { path = "../../vendor/expander/gkr_engine" }
+gf2 = { path = "../../vendor/expander/arith/gf2" }
+gf2_128 = { path = "../../vendor/expander/arith/gf2_128" }
+polynomials = { path = "../../vendor/expander/arith/polynomials" }
+serdes = { path = "../../vendor/expander/serdes" }
+arith = { path = "../../vendor/expander/arith" }
+transcript = { path = "../../vendor/expander/transcript" }
+gkr_hashers = { path = "../../vendor/expander/hasher" }
+
+# Reverse-FFI bindings to the real Go rsema1d PCS (byte-identical commitments).
+rsema1d-sys = { path = "../rsema1d-sys" }
+
+rand = "0.8.5"
+
+[dev-dependencies]
+rand = "0.8.5"

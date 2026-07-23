@@ -1,0 +1,59 @@
+# Spamoor configuration — per-block rollup workload for the accidental-computer demo.
+#
+# Target mix per slot/block (approximate; spamoor throughput is per-slot):
+#   2x normal ETH transfers   (eoatx,   throughput 2)
+#   1x contract deployment    (deploytx, throughput 1)
+#   4x contract write-calls   (erctx = ERC20 transfers => SSTORE writes, throughput 4)
+#
+# This exercises the REAL ev-reth executor on deploys + state-changing calls (not just
+# transfers), which is what proves the celestia-zkevm executor crate is genuinely used.
+# All scenarios share one pre-funded genesis wallet seed family.
+
+- scenario: eoatx
+  name: "Normal ETH transfers"
+  description: "2 plain value transfers per block"
+  config:
+    seed: acc-eoatx
+    refill_amount: 1000000000000000000
+    refill_balance: 500000000000000000
+    refill_interval: 600
+    throughput: 2
+    max_pending: 8
+    max_wallets: 2
+    base_fee: 20
+    tip_fee: 2
+    amount: 100
+    random_amount: true
+    random_target: true
+
+- scenario: deploytx
+  name: "Contract deployment"
+  description: "1 contract deployment per block"
+  config:
+    seed: acc-deploy
+    refill_amount: 2000000000000000000
+    refill_balance: 500000000000000000
+    refill_interval: 600
+    throughput: 1
+    max_pending: 4
+    max_wallets: 1
+    base_fee: 20
+    tip_fee: 2
+    # Init code that returns the demo runtime (PUSH1 0x2a; PUSH1 0x00; SSTORE;
+    # PUSH1 0x01; PUSH1 0x00; RETURN) — the same contract the block-STF proof
+    # commits. CODECOPY the 10-byte runtime at offset 0x0c and RETURN it.
+    bytecodes: "0x600a600c600039600a6000f3602a60005560016000f3"
+
+- scenario: erctx
+  name: "Contract write-calls (ERC20 transfers)"
+  description: "4 state-changing contract calls per block"
+  config:
+    seed: acc-erc
+    refill_amount: 2000000000000000000
+    refill_balance: 500000000000000000
+    refill_interval: 600
+    throughput: 4
+    max_pending: 16
+    max_wallets: 2
+    base_fee: 20
+    tip_fee: 2

@@ -2,3 +2,11 @@ vendor
 build
 README.md
 data
+# Rust build caches — never needed inside any image, and huge (multi-GB).
+# Keeps the docker build context small for docker/rv32-rollup.Dockerfile.
+# (.git is intentionally NOT ignored: docker/standalone.Dockerfile runs
+# `make build-standalone`, which reads git describe/rev-parse for version info.)
+**/target
+test/accidental-computer/dashboard/node_modules
+test/accidental-computer/.build
+test/accidental-computer/.run

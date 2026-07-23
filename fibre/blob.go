@@ -59,20 +59,119 @@ func DefaultBlobConfigV0() BlobConfig {
 	return defaultBlobConfigV0
 }
 
+// v1 (rv32 GKR square) erasure shape. Unlike v0, the committed rows ARE the
+// rsema1d square produced by [rsema1d.EncodeGKRInputSquare]: the rv32 GKR
+// prover commits an rsema1d square with K=N (num_vars=11 => K=512, N=512) and a
+// fixed row length of one Leopard chunk (64 bytes), with NO 5-byte v0 blob
+// header. v1 therefore must not re-encode or prepend a header — the on-chain
+// commitment must equal the prover's exact commitment. The rv32 circuit shape
+// is constant, so v1 is a single fixed config.
+const (
+	// blobV1OriginalRows is K for the rv32 GKR square (1<<(numVars-2), numVars=11).
+	blobV1OriginalRows = 512
+	// blobV1ParityRows is N for the rv32 GKR square (K=N).
+	blobV1ParityRows = 512
+	// blobV1RowLen is the fixed row length in bytes (one Leopard chunk, gkrRowBytes).
+	blobV1RowLen = 64
+)
+
+// protocolParamsV1 describes the v1 erasure shape (K=N=512, EncodingRatio 0.5).
+// It is used only to derive the codec work-buffer sizing (CodecWorkRows) and
+// parity count; v1 row size is a fixed constant and does NOT go through
+// [ProtocolParams.RowSize] (which is version-0 only).
+var protocolParamsV1 = ProtocolParams{
+	Rows:                       blobV1OriginalRows,
+	EncodingRatio:              0.5, // K=N => half original, half parity
+	MaxValidatorCount:          DefaultProtocolParams.MaxValidatorCount,
+	UniqueDecodingSecurityBits: DefaultProtocolParams.UniqueDecodingSecurityBits,
+	SafetyThreshold:            DefaultProtocolParams.SafetyThreshold,
+	LivenessThreshold:          DefaultProtocolParams.LivenessThreshold,
+	MaxBlobSize:                blobV1OriginalRows * blobV1RowLen,
+	MinRowSize:                 blobV1RowLen,
+}
+
+// defaultBlobConfigV1 is the shared v1 config, created at init time.
+var defaultBlobConfigV1 = func() BlobConfig {
+	cfg, err := newBlobConfigV1()
+	if err != nil {
+		panic(fmt.Sprintf("creating default blob config v1: %v", err))
+	}
+	return cfg
+}()
+
+// DefaultBlobConfigV1 returns the [BlobConfig] for version 1 (the rv32 GKR
+// square shape: K=512, N=512, rowLen=64, no header). Created once at init and
+// shared across all callers.
+func DefaultBlobConfigV1() BlobConfig {
+	return defaultBlobConfigV1
+}
+
 // BlobConfigForVersion returns the [BlobConfig] for the given blob version.
 // Returns an error if the version is not supported.
 func BlobConfigForVersion(version uint8) (BlobConfig, error) {
 	switch version {
 	case 0:
 		return DefaultBlobConfigV0(), nil
+	case 1:
+		return DefaultBlobConfigV1(), nil
 	default:
 		return BlobConfig{}, fmt.Errorf("unsupported blob version: %d", version)
 	}
 }
 
+// newBlobConfigV1 builds the fixed v1 config (K=512, N=512, rowLen=64, no
+// header). It reproduces EXACTLY what [rsema1d.EncodeGKRInputSquare] produces
+// for numVars=11 so that a blob built via [NewBlobFromExtendedData] for a v1
+// square has blob.ID().Commitment() == ed.Commitment() and the server can
+// reconstruct/verify the same K=512,N=512 layout.
+func newBlobConfigV1() (BlobConfig, error) {
+	const blobVersion = 1
+	k := protocolParamsV1.Rows
+	n := protocolParamsV1.ParityRows()
+	rowLen := blobV1RowLen
+	maxRowSize := blobV1RowLen
+
+	codecCfg := &rsema1d.Config{
+		K:           k,
+		N:           n,
+		WorkerCount: runtime.GOMAXPROCS(0),
+	}
+
+	assembler, err := row.NewAssembler(k, n, maxRowSize, codecCfg.TreeBufferSize())
+	if err != nil {
+		return BlobConfig{}, fmt.Errorf("creating v1 row assembler: %w", err)
+	}
+
+	workPool := row.NewPool(maxRowSize, protocolParamsV1.CodecWorkRows())
+	coder, err := rsema1d.NewCoder(codecCfg, reedsolomon.WithWorkAllocator(workPool))
+	if err != nil {
+		return BlobConfig{}, fmt.Errorf("creating v1 rsema1d coder: %w", err)
+	}
+	dataPool := row.NewPool(maxRowSize, k)
+
+	return BlobConfig{
+		BlobVersion:  blobVersion,
+		OriginalRows: k,
+		ParityRows:   n,
+		// v1 rows are the fixed-size rsema1d square rows; there is NO blob header,
+		// so row size is a constant independent of any data length.
+		RowSize:       func(int) int { return rowLen },
+		MaxDataSize:   k * rowLen,
+		MaxRowSize:    maxRowSize,
+		CodingWorkers: runtime.GOMAXPROCS(0),
+		Coder:         coder,
+		Assembler:     assembler,
+		DataPool:      dataPool,
+	}, nil
+}
+
 // NewBlobConfigFromParams creates a [BlobConfig] with values derived from the given [ProtocolParams].
 // Use this when you need a config with non-default protocol parameters (e.g., for testing).
+// Version 1 has a fixed shape (K=512, N=512, rowLen=64) and ignores params.
 func NewBlobConfigFromParams(blobVersion uint8, params ProtocolParams) (BlobConfig, error) {
+	if blobVersion == 1 {
+		return newBlobConfigV1()
+	}
 	if blobVersion != 0 {
 		return BlobConfig{}, fmt.Errorf("unsupported blob version: %d", blobVersion)
 	}

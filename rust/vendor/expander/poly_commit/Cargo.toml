@@ -1,0 +1,58 @@
+[package]
+name = "poly_commit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arith = { path = "../arith" }
+gf2 = { path = "../arith/gf2" }
+gkr_engine = { path = "../gkr_engine" }
+polynomials = { path = "../arith/polynomials"}
+serdes = { path = "../serdes" }
+transcript = { path = "../transcript" }
+tree = { path = "../tree" }
+utils = { path = "../utils" }
+sumcheck = { path = "../sumcheck" }
+msm_cuda = { path = "./msm_cuda", optional = true}
+
+ethnum.workspace = true
+ark-std.workspace = true
+derivative.workspace = true
+halo2curves.workspace = true
+itertools.workspace = true
+rand.workspace = true
+rayon.workspace = true
+transpose.workspace = true
+thiserror.workspace = true
+
+
+[dev-dependencies]
+gf2_128 = { path = "../arith/gf2_128" }
+mersenne31 = { path = "../arith/mersenne31" }
+goldilocks = { path = "../arith/goldilocks" }
+gkr_hashers = { path = "../hasher" }
+
+tynm.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "orion"
+harness = false
+
+[[bench]]
+name = "hyrax"
+harness = false
+
+[[bench]]
+name = "pcs_all"
+harness = false
+
+[build-dependencies]
+cc = { version = "1", features = ["parallel"] }
+
+[features]
+default = [ ]
+profile = [ "utils/profile" ]
+cuda_msm = [ "msm_cuda" ]
+cuda_pcs = [ "tree/cuda_tree" ]
+low-memory = [ ]

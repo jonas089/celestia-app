@@ -32,7 +32,9 @@ type Server struct {
 	tracer  trace.Tracer
 	metrics *serverMetrics
 
-	verifiers chan *rsema1d.Verifier // caps concurrent verifications
+	// verifiers holds a pool of rsema1d verifiers per blob version. Each pool's
+	// channel capacity caps concurrent verifications for that version.
+	verifiers map[uint8]chan *rsema1d.Verifier
 
 	pruneDone chan struct{}
 	cancel    context.CancelFunc
@@ -61,7 +63,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		log:       cfg.Log,
 		tracer:    cfg.Tracer,
 		metrics:   metrics,
-		verifiers: newVerifierPool(cfg.UploadVerifyWorkers),
+		verifiers: newVerifierPools(cfg.UploadVerifyWorkers),
 	}
 
 	server.grpc, err = fibregrpc.Listen(cfg.ServerListenAddress)

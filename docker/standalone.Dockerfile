@@ -46,6 +46,12 @@ RUN uname -a &&\
     CGO_ENABLED=${CGO_ENABLED} GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     make build-standalone
 
+# Also build the fibre server binary (build/fibre). The accidental-computer stack
+# runs it as a dedicated service that records rsema1d commitments on-chain via
+# MsgPayForFibre. It is pure-Go (CGO not required) so it links statically here.
+RUN CGO_ENABLED=${CGO_ENABLED} GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    make build-fibre-server
+
 # Stage 2: Create a minimal image to run the celestia-appd binary
 # Ignore hadolint rule because hadolint can't parse the variable.
 # See https://github.com/hadolint/hadolint/issues/339
@@ -69,6 +75,8 @@ RUN apk update && apk add --no-cache \
     -u ${UID}
 # Copy the celestia-appd binary from the builder into the final image.
 COPY --from=builder /celestia-app/build/celestia-appd /bin/celestia-appd
+# Copy the fibre server binary (used by the accidental-computer fibre-server service).
+COPY --from=builder /celestia-app/build/fibre /bin/fibre
 # Copy the entrypoint script into the final image.
 COPY --chown=${USER_NAME}:${USER_NAME} docker/entrypoint.sh /opt/entrypoint.sh
 # Set the user to celestia.

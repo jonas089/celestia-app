@@ -1,0 +1,19 @@
+[package]
+name = "crosslayer_prototype"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arith = { path = "../arith" }
+gkr_engine = { path = "../gkr_engine" }
+gkr_hashers = { path = "../hasher" }
+polynomials = { path = "../arith/polynomials" }
+sumcheck = { path = "../sumcheck" }
+serdes = { path = "../serdes" }
+transcript = { path = "../transcript" }
+
+env_logger.workspace = true
+ethnum.workspace = true
+log.workspace = true
+rand.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,7 @@
+allowBuilds:
+  esbuild: set this to true or false
+# pnpm v11 reads build-script allowlists from here.
+# esbuild ships a platform binary via its install script and must be allowed.
+onlyBuiltDependencies:
+  - esbuild
+verifyDepsBeforeRun: false

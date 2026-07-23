@@ -1,0 +1,15 @@
+[package]
+name = "rsema1d-sys"
+version = "0.1.0"
+edition = "2021"
+description = "Reverse-FFI Rust bindings to the real Go rsema1d multilinear PCS (librsema1d.dylib), guaranteeing byte-identical commitments with the celestia-app DA layer."
+
+# Own workspace root so this crate has its own Cargo.lock and does not join /
+# perturb the existing rust/ workspace lock. It lives under rust/crates/ only
+# for locality.
+[workspace]
+
+[dependencies]
+
+[dev-dependencies]
+hex = "0.4"

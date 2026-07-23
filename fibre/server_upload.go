@@ -263,11 +263,11 @@ func (s *Server) verifyShard(ctx context.Context, blobCfg BlobConfig, promise *P
 		rows[i] = row
 	}
 
-	verifier, err := s.getVerifier(ctx)
+	verifier, err := s.getVerifier(ctx, blobCfg.BlobVersion)
 	if err != nil {
 		return fmt.Errorf("acquiring verifier: %w", err)
 	}
-	defer s.putVerifier(verifier)
+	defer s.putVerifier(blobCfg.BlobVersion, verifier)
 
 	if err := verifier.Verify(promise.Commitment, rows, rlcs); err != nil {
 		return fmt.Errorf("shard row verification failed: %w", err)
@@ -276,11 +276,21 @@ func (s *Server) verifyShard(ctx context.Context, blobCfg BlobConfig, promise *P
 	return nil
 }
 
-// newVerifierPool eagerly populates a buffered channel with n Verifiers
-// for the v0 blob layout, each pinned to WorkerCount=1 (concurrency is
-// the channel capacity).
-func newVerifierPool(n int) chan *rsema1d.Verifier {
-	blobCfg := DefaultBlobConfigV0()
+// newVerifierPools eagerly builds one verifier pool per supported blob version.
+// Each pool is a buffered channel of n Verifiers sized to that version's blob
+// layout, each pinned to WorkerCount=1 (concurrency is the channel capacity).
+// v0 = DefaultBlobConfigV0 (K=4096, N=12288); v1 = DefaultBlobConfigV1 (the
+// rv32 GKR square shape, K=512, N=512).
+func newVerifierPools(n int) map[uint8]chan *rsema1d.Verifier {
+	return map[uint8]chan *rsema1d.Verifier{
+		0: newVerifierPool(n, DefaultBlobConfigV0()),
+		1: newVerifierPool(n, DefaultBlobConfigV1()),
+	}
+}
+
+// newVerifierPool eagerly populates a buffered channel with n Verifiers sized
+// for the given blob layout, each pinned to WorkerCount=1.
+func newVerifierPool(n int, blobCfg BlobConfig) chan *rsema1d.Verifier {
 	verifiers := make(chan *rsema1d.Verifier, n)
 	for i := range n {
 		v, err := rsema1d.NewVerifier(&rsema1d.Config{
@@ -289,32 +299,38 @@ func newVerifierPool(n int) chan *rsema1d.Verifier {
 			WorkerCount: 1,
 		})
 		if err != nil {
-			panic(fmt.Sprintf("creating verifier %d: %v", i, err))
+			panic(fmt.Sprintf("creating v%d verifier %d: %v", blobCfg.BlobVersion, i, err))
 		}
 		verifiers <- v
 	}
 	return verifiers
 }
 
-// getVerifier returns a Verifier from the pool, blocking until one is free
-// or ctx is cancelled. Pair with putVerifier.
-func (s *Server) getVerifier(ctx context.Context) (*rsema1d.Verifier, error) {
+// getVerifier returns a Verifier from the pool for the given blob version,
+// blocking until one is free or ctx is cancelled. Pair with putVerifier.
+func (s *Server) getVerifier(ctx context.Context, blobVersion uint8) (*rsema1d.Verifier, error) {
+	pool, ok := s.verifiers[blobVersion]
+	if !ok {
+		return nil, fmt.Errorf("no verifier pool for blob version %d", blobVersion)
+	}
 	select {
-	case v := <-s.verifiers:
+	case v := <-pool:
 		return v, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 }
 
-// putVerifier returns a Verifier to the pool. The channel is sized to pool
-// capacity, so this never blocks for any verifier previously obtained via
-// getVerifier.
-func (s *Server) putVerifier(v *rsema1d.Verifier) {
+// putVerifier returns a Verifier to the pool for the given blob version. The
+// channel is sized to pool capacity, so this never blocks for any verifier
+// previously obtained via getVerifier.
+func (s *Server) putVerifier(blobVersion uint8, v *rsema1d.Verifier) {
 	if v == nil {
 		return
 	}
-	s.verifiers <- v
+	if pool, ok := s.verifiers[blobVersion]; ok {
+		pool <- v
+	}
 }
 
 // parseRowSize determines and validates the row size from all rows.

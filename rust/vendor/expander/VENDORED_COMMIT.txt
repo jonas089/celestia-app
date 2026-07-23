@@ -1,0 +1,3 @@
+COMMIT: 096581e1957c05be034857e24bb6ea8e8875e093
+SOURCE: https://github.com/PolyhedraZK/Expander.git
+DATE: 2026-07-20

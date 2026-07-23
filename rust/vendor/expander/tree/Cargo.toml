@@ -1,0 +1,28 @@
+[package]
+name = "tree"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arith = { path = "../arith" }
+blake3 = "1.5"
+rayon = "1.10"
+serdes = { path = "../serdes" }
+
+ark-std.workspace = true
+tiny-keccak.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+tynm.workspace = true
+
+gf2 = { path = "../arith/gf2" }
+gf2_128 = { path = "../arith/gf2_128" }
+
+[features]
+default = []
+cuda_tree = []
+
+[[bench]]
+name = "tree"
+harness = false
