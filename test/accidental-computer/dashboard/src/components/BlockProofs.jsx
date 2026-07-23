@@ -102,9 +102,12 @@ function BlockCard({ b, label }) {
                   <span className="daflag daflag--ok">== DA</span><CopyButton value={b.commitment} label="⧉" /></span>
               : <span className="muted">pending…</span>}
           </Metric>
-          <Metric label="post-state root">
-            {b.stfStateRoot
-              ? <span className="mono metric__hex" title={b.stfStateRoot}>{truncHex(b.stfStateRoot, 10, 6)}<CopyButton value={b.stfStateRoot} label="⧉" /></span>
+          <Metric label="state root · pre → post">
+            {b.postRoot
+              ? <span className="mono metric__hex" title={`pre  ${b.preRoot}\npost ${b.postRoot}`}>
+                  {truncHex(b.preRoot, 6, 4)} → {truncHex(b.postRoot, 6, 4)}
+                  <CopyButton value={b.postRoot} label="⧉" />
+                </span>
               : <span className="muted">pending…</span>}
           </Metric>
           <Metric label="GKR verified">
@@ -171,6 +174,8 @@ function OverviewTab({ b, words }) {
       <div className="kv">
         <KV k="block height" v={`#${b.blockNumber}`} />
         <KV k="status" v={b.status} />
+        <KV k="pre-state root" v={b.preRoot ? truncHex(b.preRoot, 12, 10) : '—'} full={b.preRoot} copy />
+        <KV k="post-state root" v={b.postRoot ? truncHex(b.postRoot, 12, 10) : '—'} full={b.postRoot} copy />
         <KV k="cycles executed" v={(b.numCycles || 0).toLocaleString()} />
         <KV k="GKR input vars" v={b.inputVars} />
         <KV k="DA settlement height" v={b.daHeight || '—'} />
@@ -297,7 +302,7 @@ function VerifyTab({ b }) {
     { name: 'GKR input commitment == reused rsema1d/DA encoding (32 bytes)', ok: (b.commitment || '').replace(/^0x/, '').length === 64 },
     { name: 'block settled on Celestia DA (fibre MsgPayForFibre)', ok: (b.daHeight || 0) > 0 || !!b.txHash },
     { name: 'public output present', ok: !!b.output && b.output !== '0x' },
-    { name: 'post-state root committed (persistent VM state)', ok: !!b.stfStateRoot },
+    { name: 'state transition bound in-circuit (pre_root → post_root)', ok: !!b.preRoot && !!b.postRoot },
   ]
   const verified = proved && b.verified
   return (

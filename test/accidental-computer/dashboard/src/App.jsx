@@ -154,10 +154,10 @@ function VmStatePanel({ blocks }) {
     <div className="panel">
       <div className="panel__head"><span className="panel__dot" /><h3>Persistent VM state</h3></div>
       <div className="vmrow">
-        <span className="vmrow__k">current post-state root</span>
+        <span className="vmrow__k">current state root</span>
         <span className="vmrow__v">
-          {lastProved?.stfStateRoot
-            ? <span className="mono">{truncHex(lastProved.stfStateRoot, 10, 8)}<CopyButton value={lastProved.stfStateRoot} label="⧉" /></span>
+          {lastProved?.postRoot
+            ? <span className="mono">{truncHex(lastProved.postRoot, 10, 8)}<CopyButton value={lastProved.postRoot} label="⧉" /></span>
             : <span className="muted">—</span>}
         </span>
       </div>

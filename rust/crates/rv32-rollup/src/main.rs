@@ -127,6 +127,8 @@ struct BlockRecord {
     blob_id: String, // fibre blob id (fibre mode only)
     program_name: String, // sample program name (e.g. "sum_1_to_n")
     rust_source: String,  // simple no_std Rust source the program was compiled from
+    pre_root: String,     // register-state root before execution (bound in-circuit)
+    post_root: String,    // register-state root after execution (bound in-circuit)
 }
 impl BlockRecord {
     fn to_json(&self) -> Value {
@@ -135,6 +137,8 @@ impl BlockRecord {
             "blockNumber": self.height,
             "programName": self.program_name,
             "rustSource": self.rust_source,
+            "preRoot": self.pre_root,
+            "postRoot": self.post_root,
             "status": self.status,
             "verified": self.verified,
             "commitment": self.commitment,
@@ -473,6 +477,7 @@ fn block_worker(rx: std::sync::mpsc::Receiver<Submission>, cache: Cache) {
                     proof_bytes: 0, elapsed_ms: 0, submitted_unix: submitted, proved_unix: 0, error: String::new(),
                     tx_hash: String::new(), blob_id: String::new(),
                     program_name: sub.name.clone(), rust_source: sub.source.clone(),
+                    pre_root: String::new(), post_root: String::new(),
                 });
             }
             eprintln!("rv32-rollup: block #{h}: executing + proving ({} instrs, {} input bytes)", sub.program.len(), sub.input.len());
@@ -543,6 +548,8 @@ fn block_worker(rx: std::sync::mpsc::Receiver<Submission>, cache: Cache) {
                     rec.num_cycles = p.num_cycles;
                     rec.input_vars = p.input_vars;
                     rec.proof_bytes = p.proof.len();
+                    rec.pre_root = hexs(&p.pre_root);
+                    rec.post_root = hexs(&p.post_root);
                     if let Some((_, tx, bid)) = &fibre_da {
                         rec.tx_hash = tx.clone();
                         rec.blob_id = bid.clone();

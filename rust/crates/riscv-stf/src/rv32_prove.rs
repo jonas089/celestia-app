@@ -19,6 +19,7 @@ use gkr_engine::{GF2ExtConfig, MPIConfig, MPIEngine};
 use polynomials::MultiLinearPoly;
 use rsema1d_pcs::Rsema1dGKRConfig;
 
+use crate::batch_keccak::keccak256_fixed;
 use crate::emulator::Cpu;
 use crate::rv32_circuit::{run, Rv32Cfg, Rv32State, W};
 
@@ -40,6 +41,12 @@ declare_circuit!(Rv32Circuit {
     // ---- PUBLIC OUTPUT (bound to the native golden) ----
     post_regs: [[PublicVariable; 32]; NREG],   // final register file
     post_mem: [[PublicVariable; 32]; MEM_SLOTS], // final memory values
+    // ---- ROLLUP STATE TRANSITION (genuine root -> root) ----
+    // pre_root = keccak256(pre-state), post_root = keccak256(post-state), both
+    // computed IN-CIRCUIT and bound below. The state is the register file (the
+    // persistent state carried block->block), so post_root(n) == pre_root(n+1).
+    pre_root: [PublicVariable; 256],
+    post_root: [PublicVariable; 256],
 });
 
 impl Define<GF2Config> for Rv32Circuit<Variable> {
@@ -63,7 +70,47 @@ impl Define<GF2Config> for Rv32Circuit<Variable> {
                 api.assert_is_equal(fin.mem_val[j][b], self.post_mem[j][b]);
             }
         }
+
+        // ---- genuine rollup state transition: bind pre_root / post_root ----
+        // State root = keccak256 over the 32 register words, each 4 LE bytes
+        // (128-byte preimage). Computed in-circuit so it is bound to the
+        // COMMITTED pre-state and the PROVEN post-state; chained across blocks by
+        // the sequencer feeding post_root(n) as pre_root(n+1).
+        let pre_bits = regs_to_bits(&self.pre_regs.iter().map(|r| r.to_vec()).collect::<Vec<_>>());
+        let pre_hash = keccak256_fixed(api, &pre_bits, NREG * 4);
+        for i in 0..256 {
+            api.assert_is_equal(pre_hash[i], self.pre_root[i]);
+        }
+        let post_bits = regs_to_bits(&fin.regs);
+        let post_hash = keccak256_fixed(api, &post_bits, NREG * 4);
+        for i in 0..256 {
+            api.assert_is_equal(post_hash[i], self.post_root[i]);
+        }
     }
+}
+
+/// Flatten a register file (NREG words, each 32 bits LSB-first) into a keccak
+/// bit buffer: word i occupies bytes [4i, 4i+4) as little-endian, i.e. bit b of
+/// word i lands at msg bit i*32 + b. The native reference (`regs_root`) hashes
+/// the identical byte layout.
+fn regs_to_bits(regs: &[Vec<Variable>]) -> Vec<Variable> {
+    let mut bits = Vec::with_capacity(regs.len() * 32);
+    for r in regs {
+        for b in 0..32 {
+            bits.push(r[b]);
+        }
+    }
+    bits
+}
+
+/// Native reference for the in-circuit register-state root: keccak256 over the
+/// 32 register words as little-endian bytes (128-byte preimage). x0 is 0.
+fn regs_root(regs: &[u32; 32]) -> [u8; 32] {
+    let mut buf = [0u8; NREG * 4];
+    for i in 0..NREG {
+        buf[i * 4..i * 4 + 4].copy_from_slice(&regs[i].to_le_bytes());
+    }
+    crate::mpt::keccak256(&buf)
 }
 
 pub struct Rv32Proof {
@@ -75,6 +122,9 @@ pub struct Rv32Proof {
     pub input_vars: u32,
     pub verified: bool,
     pub proof: Vec<u8>,
+    /// Register-state roots for the block's transition (bound in-circuit).
+    pub pre_root: [u8; 32],
+    pub post_root: [u8; 32],
 }
 
 /// The result of [`rv32_prepare`]: everything a prover needs to open the GKR
@@ -100,6 +150,10 @@ pub struct Rv32Prepared {
     pub post_mem: Vec<(u32, u32)>,
     /// Number of executed cycles (native golden).
     pub num_cycles: u32,
+    /// Register-state root before execution (keccak256, bound in-circuit).
+    pub pre_root: [u8; 32],
+    /// Register-state root after execution (keccak256, bound in-circuit).
+    pub post_root: [u8; 32],
 }
 
 /// PHASE 1 of the accidental-computer weld: run the native emulator to get the
@@ -247,6 +301,18 @@ pub fn rv32_prepare(
             asg.post_mem[j][b] = ((v >> b) & 1).into();
         }
     }
+    // Genuine state-transition roots (register-file state). Committed pre-state
+    // has x0 = 0 (matching the circuit's committed pre_regs assignment above).
+    let mut pre_regs_committed = *pre_regs;
+    pre_regs_committed[0] = 0;
+    let pre_root = regs_root(&pre_regs_committed);
+    let post_root = regs_root(&post_regs);
+    for i in 0..32 {
+        for j in 0..8 {
+            asg.pre_root[i * 8 + j] = (((pre_root[i] >> j) & 1) as u32).into();
+            asg.post_root[i * 8 + j] = (((post_root[i] >> j) & 1) as u32).into();
+        }
+    }
 
     let witness = witness_solver.solve_witnesses(&vec![asg; 8]).map_err(|e| format!("witness: {e:?}"))?;
     if !layered_circuit.run(&witness).iter().all(|x| *x) {
@@ -290,6 +356,8 @@ pub fn rv32_prepare(
         post_regs,
         post_mem,
         num_cycles,
+        pre_root,
+        post_root,
     })
 }
 
@@ -307,7 +375,7 @@ pub fn rv32_prove_prepared(
     da_root: [u8; 32],
     extended: &[u8],
 ) -> Result<Rv32Proof, String> {
-    let Rv32Prepared { mut ec, num_vars, input_vals_bytes: _, output, post_regs, post_mem, num_cycles } =
+    let Rv32Prepared { mut ec, num_vars, input_vals_bytes: _, output, post_regs, post_mem, num_cycles, pre_root, post_root } =
         prepared;
 
     // Reconstruct + install the DA-side commitment from the serialized extended
@@ -349,6 +417,8 @@ pub fn rv32_prove_prepared(
         input_vars: num_vars,
         verified,
         proof: proof.bytes,
+        pre_root,
+        post_root,
     })
 }
 
