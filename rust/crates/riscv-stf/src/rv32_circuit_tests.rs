@@ -74,7 +74,19 @@ fn check(name: &str, program: &[u32], input: &[u8], pre_regs: &[u32; 32], pre_me
         .unwrap_or_else(|e| panic!("[{name}] prove_rv32_block failed: {e}"));
     assert!(p.verified, "[{name}] GKR self-verify failed");
     assert_eq!(p.post_regs, exp_regs, "[{name}] in-circuit post_regs != emulator golden");
-    assert_eq!(p.post_mem, exp_mem, "[{name}] in-circuit post_mem != emulator golden");
+    // Compare committed memory as an unordered SET of real (addr,val) slots. The
+    // prover lays out committed memory as [STATE region (pre_mem + padding) ..
+    // INPUT region], whereas the emulator golden lists [INPUT .. pre_mem]; and the
+    // prover pads the STATE region up to STATE_SLOTS with prover-internal dummy
+    // slots at word addresses >= 0xE0000 (value 0, meaningless). Neither the order
+    // nor the padding is part of the state transition, so normalize both sides
+    // (drop padding, sort by address) before comparing.
+    let norm = |m: &[(u32, u32)]| -> Vec<(u32, u32)> {
+        let mut v: Vec<(u32, u32)> = m.iter().copied().filter(|&(a, _)| a < (0xE0000u32 << 2)).collect();
+        v.sort_by_key(|&(a, _)| a);
+        v
+    };
+    assert_eq!(norm(&p.post_mem), norm(&exp_mem), "[{name}] in-circuit post_mem != emulator golden");
     println!("[{name}] OK verified num_cycles={}", p.num_cycles);
     p
 }

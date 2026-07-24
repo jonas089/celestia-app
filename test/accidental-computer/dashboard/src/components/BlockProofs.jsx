@@ -78,8 +78,8 @@ function BlockCard({ b, label }) {
 
       <div className="bcard__head">
         <div className="bcard__ids">
-          <span className="bcard__height">#{b.blockNumber} <small>· {label}</small></span>
-          <span className="bcard__sub mono">{(b.numCycles || 0).toLocaleString()} cycles · {words.length} instrs</span>
+          <span className="bcard__height">#{b.blockNumber} <small>· {(b.numTx || 0).toLocaleString()} tx</small></span>
+          <span className="bcard__sub mono">{(b.numTx || 0).toLocaleString()} tx · {(b.numCycles || 0).toLocaleString()} cycles · {words.length} instrs</span>
         </div>
         <StatusBadge st={st} />
       </div>
@@ -87,6 +87,9 @@ function BlockCard({ b, label }) {
       <div className="chips">
         <span className="chip chip--flag" title="Raw rv32i executed in-circuit; the on-DA rsema1d commitment is the sole (reused) GKR input commitment.">accidental computer · in-circuit rv32i</span>
         <span className="chip chip--prog">{label}</span>
+        <span className="chip chip--tx" title={`${b.numTx || 0} transactions proven in one GKR proof across ${b.numLanes || 1} GF2x8 SIMD lane(s)`}>
+          {(b.numTx || 0).toLocaleString()} transactions{(b.numLanes || 1) > 1 ? ` · ${b.numLanes} lanes` : ''}
+        </span>
         <span className="chip chip--total">{(b.numCycles || 0).toLocaleString()} cycles</span>
         <span className="chip mono" title={b.input || '0x'}>input {b.input && b.input !== '0x' ? truncHex(b.input, 6, 4) : '∅'}</span>
         <span className="chip mono" title={b.output}>output {b.output && b.output !== '0x' ? truncHex(b.output, 6, 4) : '—'}</span>
@@ -175,6 +178,8 @@ function OverviewTab({ b, words }) {
         <KV k="status" v={b.status} />
         <KV k="pre-state root" v={b.preRoot ? truncHex(b.preRoot, 12, 10) : '—'} full={b.preRoot} copy />
         <KV k="post-state root" v={b.postRoot ? truncHex(b.postRoot, 12, 10) : '—'} full={b.postRoot} copy />
+        <KV k="transactions" v={`${(b.numTx || 0).toLocaleString()}${(b.numLanes || 1) > 1 ? ` · ${b.numLanes} SIMD lanes` : ''}`} />
+        <KV k="throughput" v={b.elapsedMs > 0 ? `${((b.numTx || 0) * 1000 / b.elapsedMs).toFixed(2)} tx/s` : '—'} />
         <KV k="cycles executed" v={(b.numCycles || 0).toLocaleString()} />
         <KV k="GKR input vars" v={b.inputVars} />
         <KV k="DA settlement height" v={b.daHeight || '—'} />

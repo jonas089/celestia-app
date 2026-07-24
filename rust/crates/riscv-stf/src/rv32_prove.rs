@@ -205,33 +205,111 @@ pub struct Rv32Prepared {
     pub post_root: [u8; 32],
 }
 
-/// PHASE 1 of the accidental-computer weld: run the native emulator to get the
-/// golden post-state, prove-solve the in-circuit interpreter reproduces it, export
-/// the Expander circuit and compute the input layer + its serialization — but do
-/// NOT encode or prove. The returned [`Rv32Prepared`] holds the exported circuit
-/// `ec` in memory; the caller hands `input_vals_bytes` to the DA side, which
-/// RS-encodes it ONCE, and then calls [`rv32_prove_prepared`] with the resulting
-/// `(root, extended)`. The prover itself performs ZERO Reed-Solomon encoding.
+/// Process-global cache of the compiled RV32I layered circuit + witness solver.
 ///
-/// `base` must be 0 (the core fixes the program base at 0). `input` bytes are
-/// packed LE into words and loaded as the initial memory region at `INPUT_ADDR`;
-/// `pre_mem` are additional committed (byte_addr, word_val) slots (the result
-/// region). `max_cycles` is clamped to the compiled step count.
-pub fn rv32_prepare(
+/// [`compile`] is a pure function of the compile-time dims (PROG_LEN, MEM_SLOTS,
+/// STATE_SLOTS, STEPS) and the [`Rv32Circuit`] structure — it does not depend on
+/// the program, input, or state of any particular block. It is also the dominant
+/// cost of proving (~45s and effectively all of the peak RAM for the default
+/// dims). We therefore compile it exactly ONCE per process (the first block pays
+/// for it) and every subsequent block reuses it, so the per-block marginal cost
+/// is just witness-solve + export + GKR prove (~10s at the default dims).
+///
+/// `solve_witnesses`, `layered_circuit.run`, and `export_to_expander_flatten` all
+/// take `&self`, so sharing the cached instances by reference is sound.
+///
+/// The circuit structure DOES depend on the unroll depth `steps()` (see
+/// [`rv32_circuit::run`]), so the cache is keyed on it: a rollup that fixes its
+/// max-cycles-per-block compiles exactly once and reuses it for every block,
+/// while a benchmark that sweeps circuit sizes compiles once per distinct size.
+/// The compiled artifacts are process-lifetime, so we `Box::leak` to hand out
+/// `&'static` references without a runtime borrow.
+thread_local! {
+    static PROVE_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII guard for [`prove_lock`]; only the outermost acquisition on a thread holds
+/// the real mutex (reentrant no-op for nested acquisitions).
+struct ProveGuard {
+    real: Option<std::sync::MutexGuard<'static, ()>>,
+}
+impl Drop for ProveGuard {
+    fn drop(&mut self) {
+        if self.real.is_some() {
+            PROVE_LOCK_HELD.with(|h| h.set(false));
+        }
+    }
+}
+
+/// Reentrant global lock guarding the whole DA-commitment critical section: the
+/// single legitimate RS-encode PLUS install -> prove (with the zero-re-encode
+/// machine-check) -> clear. Both the commitment slot and the encode-call counter
+/// are process-global, so concurrent proofs would corrupt each other's state and
+/// the accidental-computer check. Held across encode+prove by the top-level entry
+/// points; the inner `*_prepared` calls re-acquire it as a same-thread no-op. This
+/// makes every `prove_*` entry point thread-safe (e.g. the parallel test suite).
+fn prove_lock() -> ProveGuard {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    if PROVE_LOCK_HELD.with(|h| h.get()) {
+        return ProveGuard { real: None };
+    }
+    let g = LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()); // tolerate a poisoned lock from a panicked prove
+    PROVE_LOCK_HELD.with(|h| h.set(true));
+    ProveGuard { real: Some(g) }
+}
+
+fn compiled_circuit() -> Result<&'static CompileResult<GF2Config>, String> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<usize, &'static CompileResult<GF2Config>>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = steps();
+    if let Some(c) = cache.lock().unwrap().get(&key) {
+        return Ok(*c);
+    }
+    // Compile OUTSIDE the lock (it takes tens of seconds) so we never block other
+    // callers; on the rare race two callers compile the same key and one leak is
+    // wasted, which is harmless.
+    let compiled = compile(&Rv32Circuit::default(), CompileOptions::default())
+        .map_err(|e| format!("compile: {e:?}"))?;
+    let leaked: &'static CompileResult<GF2Config> = Box::leak(Box::new(compiled));
+    Ok(*cache.lock().unwrap().entry(key).or_insert(leaked))
+}
+
+/// Golden post-state + committed memory layout for ONE block, plus the fully
+/// assigned in-circuit witness. Shared by the single-block prover and the 8-way
+/// SIMD-batched prover: the GF2x8 field proves 8 lanes at once, so a batched
+/// prover builds 8 of these (one per lane) and hands them to a single solve/prove.
+struct BlockGolden {
+    output: Vec<u8>,
+    post_regs: [u32; 32],
+    post_mem: Vec<(u32, u32)>,
+    num_cycles: u32,
+    pre_root: [u8; 32],
+    post_root: [u8; 32],
+}
+
+/// Build the native golden + assigned `Rv32Circuit` witness for a single block.
+/// Does NOT compile/solve/prove (the caller does that once, for up to 8 blocks
+/// packed across the SIMD lanes). Extracted verbatim from the original
+/// `rv32_prepare` body so the single-block path is unchanged.
+fn build_block(
     program: &[u32],
     base: u32,
     input: &[u8],
     pre_regs: &[u32; 32],
     pre_mem: &[(u32, u32)],
-    max_cycles: usize,
-) -> Result<Rv32Prepared, String> {
+) -> Result<(Rv32Circuit<GF2>, BlockGolden), String> {
     if base != 0 {
         return Err("rv32 core requires base=0".into());
     }
     if program.len() > PROG_LEN {
         return Err(format!("program too long: {} > {}", program.len(), PROG_LEN));
     }
-    let _ = max_cycles; // the compiled circuit fixes the step count (STEPS)
 
     // Build the unified initial memory: input region (LE-packed words at
     // INPUT_ADDR) then the caller's pre_mem, padded with disjoint dummy slots.
@@ -254,9 +332,6 @@ pub fn rv32_prepare(
     }
     let mut slots: Vec<(u32, u32)> = Vec::new();
     let mut dummy = 0u32;
-    // STATE region [0, STATE_SLOTS): the rollup state (balances/keys). This is the
-    // region the in-circuit state root is taken over. Pad to STATE_SLOTS with
-    // disjoint dummy addresses so the rooted region is exactly the state.
     for &(a, v) in pre_mem {
         slots.push((a, v));
     }
@@ -264,7 +339,6 @@ pub fn rv32_prepare(
         slots.push(((0xE0000u32.wrapping_add(dummy)) << 2, 0));
         dummy += 1;
     }
-    // INPUT region: the block's transactions, loaded at INPUT_ADDR.
     for (k, w) in input_words.iter().enumerate() {
         slots.push((INPUT_ADDR + 4 * (k as u32), *w));
     }
@@ -290,12 +364,6 @@ pub fn rv32_prepare(
         cpu.mem.store(a, v);
     }
     let trace = cpu.run(steps());
-    // SOUNDNESS: the circuit models memory as exactly the committed MEM_SLOTS.
-    // A store to a word address that is NOT one of those slots is silently
-    // dropped by the in-circuit STF (no slot's `hit` fires), yet post_mem only
-    // reads the declared slot addresses, so the divergence would be masked and
-    // the proof would still verify. Reject such programs up front — the machine
-    // cannot faithfully model a store outside its committed memory footprint.
     {
         use std::collections::HashSet;
         let declared: HashSet<u32> = slots.iter().map(|&(a, _)| a >> 2).collect();
@@ -316,7 +384,6 @@ pub fn rv32_prepare(
         .find(|r| r.next_pc == r.pc)
         .map(|r| r.cycle + 1)
         .unwrap_or(steps() as u32);
-    // Public output = the post-state (balances) region, now the leading slots.
     let mut output = Vec::new();
     for k in 0..n_user {
         let v = post_mem_full[k].1;
@@ -325,9 +392,7 @@ pub fn rv32_prepare(
     let _ = n_input;
     let post_mem: Vec<(u32, u32)> = post_mem_full[..n_real].to_vec();
 
-    // --- compile + assign committed input + bind public golden ---
-    let CompileResult { witness_solver, layered_circuit } =
-        compile(&Rv32Circuit::default(), CompileOptions::default()).map_err(|e| format!("compile: {e:?}"))?;
+    // --- assign committed input + bind public golden ---
     let mut asg = Rv32Circuit::<GF2>::default();
     for idx in 0..PROG_LEN {
         let w = if idx < program.len() { program[idx] } else { 0 };
@@ -362,8 +427,6 @@ pub fn rv32_prepare(
             asg.post_mem[j][b] = ((v >> b) & 1).into();
         }
     }
-    // Genuine rollup state-transition roots over the STATE region (balances/keys):
-    // pre_root = keccak(initial state), post_root = keccak(final state).
     let pre_state_vals: Vec<u32> = slots[0..STATE_SLOTS].iter().map(|&(_, v)| v).collect();
     let post_state_vals: Vec<u32> = post_mem_full[0..STATE_SLOTS].iter().map(|&(_, v)| v).collect();
     let pre_root = state_root(&pre_state_vals);
@@ -375,13 +438,54 @@ pub fn rv32_prepare(
         }
     }
 
+    Ok((asg, BlockGolden { output, post_regs, post_mem, num_cycles, pre_root, post_root }))
+}
+
+/// PHASE 1 of the accidental-computer weld: run the native emulator to get the
+/// golden post-state, prove-solve the in-circuit interpreter reproduces it, export
+/// the Expander circuit and compute the input layer + its serialization — but do
+/// NOT encode or prove. The returned [`Rv32Prepared`] holds the exported circuit
+/// `ec` in memory; the caller hands `input_vals_bytes` to the DA side, which
+/// RS-encodes it ONCE, and then calls [`rv32_prove_prepared`] with the resulting
+/// `(root, extended)`. The prover itself performs ZERO Reed-Solomon encoding.
+///
+/// `base` must be 0 (the core fixes the program base at 0). `input` bytes are
+/// packed LE into words and loaded as the initial memory region at `INPUT_ADDR`;
+/// `pre_mem` are additional committed (byte_addr, word_val) slots (the result
+/// region). `max_cycles` is clamped to the compiled step count.
+pub fn rv32_prepare(
+    program: &[u32],
+    base: u32,
+    input: &[u8],
+    pre_regs: &[u32; 32],
+    pre_mem: &[(u32, u32)],
+    max_cycles: usize,
+) -> Result<Rv32Prepared, String> {
+    let _ = max_cycles; // the compiled circuit fixes the step count (STEPS)
+    // Native golden + fully-assigned witness for this single block.
+    let (asg, __g) = build_block(program, base, input, pre_regs, pre_mem)?;
+    let BlockGolden { output, post_regs, post_mem, num_cycles, pre_root, post_root } = __g;
+
+    // Compile the input-independent layered circuit once per process (cached).
+    let timing = std::env::var("RV32_TIMING").ok().as_deref() == Some("1");
+    let tc = std::time::Instant::now();
+    let compiled = compiled_circuit()?;
+    let witness_solver = &compiled.witness_solver;
+    let layered_circuit = &compiled.layered_circuit;
+    if timing { eprintln!("[timing]   compile (cached, input-independent): {}ms", tc.elapsed().as_millis()); }
+    let tw = std::time::Instant::now();
     let witness = witness_solver.solve_witnesses(&vec![asg; 8]).map_err(|e| format!("witness: {e:?}"))?;
+    if timing { eprintln!("[timing]   solve_witnesses (per-block): {}ms", tw.elapsed().as_millis()); }
+    let tr = std::time::Instant::now();
     if !layered_circuit.run(&witness).iter().all(|x| *x) {
         return Err("in-circuit rv32 STF != native emulator post-state".into());
     }
+    if timing { eprintln!("[timing]   layered_circuit.run (sanity, per-block): {}ms", tr.elapsed().as_millis()); }
 
     // --- export, install the DA commitment over the INPUT LAYER, GKR prove/verify ---
+    let tx = std::time::Instant::now();
     let mut ec = layered_circuit.export_to_expander_flatten();
+    if timing { eprintln!("[timing]   export_to_expander_flatten (per-block): {}ms", tx.elapsed().as_millis()); }
     let (simd_input, simd_public_input) = witness.to_simd::<gf2::GF2x8>();
     ec.layers[0].input_vals = simd_input.clone();
     ec.public_input = simd_public_input.clone();
@@ -439,6 +543,16 @@ pub fn rv32_prove_prepared(
     let Rv32Prepared { mut ec, num_vars, input_vals_bytes: _, output, post_regs, post_mem, num_cycles, pre_root, post_root } =
         prepared;
 
+    // Serialize the install -> prove -> clear critical section: the DA commitment
+    // is process-global (rsema1d_pcs::DA_COMMITMENT), so concurrent proofs would
+    // otherwise stomp each other's installed commitment.
+    let _prove_guard = prove_lock();
+
+    // Optional phase timing (set RV32_TIMING=1). Helps locate the prover
+    // bottleneck (commitment install vs GKR prove vs verify).
+    let timing = std::env::var("RV32_TIMING").ok().as_deref() == Some("1");
+    let t = std::time::Instant::now();
+
     // Reconstruct + install the DA-side commitment from the serialized extended
     // matrix. load_extended rebuilds ONLY the commitment structures (no RS-encode)
     // and asserts the reconstructed root equals `da_root`.
@@ -447,13 +561,18 @@ pub fn rv32_prove_prepared(
         rsema1d_pcs::clear_da_commitment();
         return Err("reconstructed DA root != supplied DA root".into());
     }
+    if timing { eprintln!("[timing] install_da_commitment: {}ms", t.elapsed().as_millis()); }
 
     let mpi = MPIConfig::prover_new(None, None);
     // MACHINE-CHECK: the prover must perform ZERO RS-encodes across prove+verify.
     let encodes_before = rsema1d_sys::encode_call_count();
+    let tp = std::time::Instant::now();
     let (claimed_v, proof) = executor::prove::<Rsema1dGKRConfig<'static>>(&mut ec, mpi.clone());
+    if timing { eprintln!("[timing] gkr_prove: {}ms", tp.elapsed().as_millis()); }
+    let tv = std::time::Instant::now();
     let verified = executor::verify::<Rsema1dGKRConfig<'static>>(&mut ec, mpi.clone(), &proof, &claimed_v)
         && claimed_v.is_zero();
+    if timing { eprintln!("[timing] gkr_verify: {}ms", tv.elapsed().as_millis()); }
     let encodes_after = rsema1d_sys::encode_call_count();
     let encode_delta = encodes_after - encodes_before;
     if encode_delta != 0 {
@@ -497,12 +616,202 @@ pub fn prove_rv32_block(
     pre_mem: &[(u32, u32)],
     max_cycles: usize,
 ) -> Result<Rv32Proof, String> {
+    // Hold the prove-lock across the legitimate encode AND the prove so the global
+    // encode-call counter stays consistent (the inner rv32_prove_prepared re-acquires
+    // it as a same-thread no-op).
+    let _prove_guard = prove_lock();
+    let timing = std::env::var("RV32_TIMING").ok().as_deref() == Some("1");
+    let t = std::time::Instant::now();
     let prepared = rv32_prepare(program, base, input, pre_regs, pre_mem, max_cycles)?;
+    if timing {
+        eprintln!("[timing] rv32_prepare (circuit build + witness solve): {}ms, num_vars={}",
+            t.elapsed().as_millis(), prepared.num_vars);
+    }
     // Stand in for the DA side: RS-encode the input layer exactly once.
+    let te = std::time::Instant::now();
     let input_vals = prepared.ec.layers[0].input_vals.clone();
     let da_poly = MultiLinearPoly::new(input_vals);
     let (root, extended) = rsema1d_pcs::da_encode_serialized(prepared.num_vars as usize, &da_poly);
+    if timing { eprintln!("[timing] da_encode (single RS-encode): {}ms", te.elapsed().as_millis()); }
     rv32_prove_prepared(prepared, root, &extended)
+}
+
+/// Native golden post-state for one lane of a batched proof.
+pub struct Rv32BlockResult {
+    pub output: Vec<u8>,
+    pub post_regs: [u32; 32],
+    pub post_mem: Vec<(u32, u32)>,
+    pub num_cycles: u32,
+    pub pre_root: [u8; 32],
+    pub post_root: [u8; 32],
+}
+
+/// One GKR proof attesting up to 8 blocks at once, one per GF2x8 SIMD lane.
+pub struct Rv32BatchProof {
+    pub commitment: [u8; 32],
+    pub verified: bool,
+    pub proof: Vec<u8>,
+    pub input_vars: u32,
+    /// Per-lane golden post-state, one entry per REAL block (unused lanes elided).
+    pub blocks: Vec<Rv32BlockResult>,
+}
+
+/// SIMD-BATCHED prover: prove up to 8 blocks in a SINGLE GKR proof by packing one
+/// block per GF2x8 SIMD lane. The GF2x8 field already proves 8 lanes together at
+/// the same cost as one, and the original single-block path filled all 8 lanes
+/// with the SAME block (wasting 7/8 of the prover). Here each lane carries a
+/// DISTINCT block (same committed program, its own input + pre_mem): 8 independent
+/// executions, all pinned by one proof and verified together, at ~1x the cost.
+/// Throughput therefore scales ~linearly with the number of packed blocks.
+///
+/// The accidental-computer weld is unchanged: the DA commitment is over the input
+/// layer, which under GF2x8 already packs all 8 lanes (byte `g` carries lane `s`
+/// in bit `s`); the prover still performs ZERO RS-encodes.
+pub fn prove_rv32_blocks_simd(
+    program: &[u32],
+    base: u32,
+    inputs: &[Vec<u8>],
+    pre_regs: &[u32; 32],
+    pre_mem: &[(u32, u32)],
+    max_cycles: usize,
+) -> Result<Rv32BatchProof, String> {
+    let _prove_guard = prove_lock(); // held across encode + prove (see prove_rv32_block)
+    let prepared = rv32_prepare_batch(program, base, inputs, pre_regs, pre_mem, max_cycles)?;
+    // Stand in for the DA side: RS-encode the (8-lane) input layer exactly once.
+    let input_vals = prepared.ec.layers[0].input_vals.clone();
+    let da_poly = MultiLinearPoly::new(input_vals);
+    let (root, extended) = rsema1d_pcs::da_encode_serialized(prepared.num_vars as usize, &da_poly);
+    rv32_prove_prepared_batch(prepared, root, &extended)
+}
+
+/// PHASE 1 of the SIMD-batched weld: build the golden + assigned witness for each
+/// of up to 8 blocks (one per GF2x8 lane), solve, and export the circuit + the
+/// input-layer serialization — but do NOT encode or prove. Mirrors [`rv32_prepare`]
+/// for the batched case so the fibre-reuse DA path can hand `input_vals_bytes` to
+/// the external encoder and open the proof against the settled commitment.
+pub struct Rv32PreparedBatch {
+    pub ec: ExpanderCircuit<GF2ExtConfig>,
+    pub num_vars: u32,
+    pub input_vals_bytes: Vec<u8>,
+    /// Per-lane golden post-state, one entry per REAL block (unused lanes elided).
+    pub blocks: Vec<Rv32BlockResult>,
+}
+
+pub fn rv32_prepare_batch(
+    program: &[u32],
+    base: u32,
+    inputs: &[Vec<u8>],
+    pre_regs: &[u32; 32],
+    pre_mem: &[(u32, u32)],
+    max_cycles: usize,
+) -> Result<Rv32PreparedBatch, String> {
+    let _ = max_cycles; // the compiled circuit fixes the step count (STEPS)
+    if inputs.is_empty() || inputs.len() > 8 {
+        return Err(format!("batch size must be 1..=8, got {}", inputs.len()));
+    }
+    let timing = std::env::var("RV32_TIMING").ok().as_deref() == Some("1");
+
+    // Per-lane golden + assignment, CHAINED: lane 0 starts from `pre_mem`; each
+    // subsequent lane starts from the previous lane's post-state (the persistent
+    // rollup state advances lane to lane). "State" is generic - the values at the
+    // caller's declared pre_mem addresses - so all `inputs.len()` sub-blocks
+    // genuinely persist and the batch is one sequential state transition.
+    let state_addrs: Vec<u32> = pre_mem.iter().map(|(a, _)| *a).collect();
+    let mut cur_pre: Vec<(u32, u32)> = pre_mem.to_vec();
+    let mut asgs: Vec<Rv32Circuit<GF2>> = Vec::with_capacity(8);
+    let mut blocks: Vec<Rv32BlockResult> = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let (asg, g) = build_block(program, base, input, pre_regs, &cur_pre)?;
+        // Next lane's pre-state = this lane's post-values at the state addresses.
+        let post: std::collections::HashMap<u32, u32> = g.post_mem.iter().copied().collect();
+        cur_pre = state_addrs.iter().map(|&a| (a, post.get(&a).copied().unwrap_or(0))).collect();
+        asgs.push(asg);
+        blocks.push(Rv32BlockResult {
+            output: g.output,
+            post_regs: g.post_regs,
+            post_mem: g.post_mem,
+            num_cycles: g.num_cycles,
+            pre_root: g.pre_root,
+            post_root: g.post_root,
+        });
+    }
+    // Fill any unused lanes by repeating the last real block (a valid execution,
+    // simply not reported) so the GF2x8 packing has all 8 lanes.
+    while asgs.len() < 8 {
+        asgs.push(asgs.last().unwrap().clone());
+    }
+
+    let compiled = compiled_circuit()?;
+    let tw = std::time::Instant::now();
+    let witness = compiled.witness_solver.solve_witnesses(&asgs).map_err(|e| format!("witness: {e:?}"))?;
+    if timing { eprintln!("[timing]   solve_witnesses (8 lanes): {}ms", tw.elapsed().as_millis()); }
+    if !compiled.layered_circuit.run(&witness).iter().all(|x| *x) {
+        return Err("in-circuit rv32 STF != native emulator post-state (batched)".into());
+    }
+
+    let txp = std::time::Instant::now();
+    let mut ec = compiled.layered_circuit.export_to_expander_flatten();
+    if timing { eprintln!("[timing]   export (8 lanes): {}ms", txp.elapsed().as_millis()); }
+    let (simd_input, simd_public_input) = witness.to_simd::<gf2::GF2x8>();
+    ec.layers[0].input_vals = simd_input.clone();
+    ec.public_input = simd_public_input.clone();
+    ec.evaluate();
+    let num_vars = ec.log_input_size();
+
+    // Serialize the 8-lane input layer for the DA-side re-encoder (identical
+    // packing to the single-block path: byte `g` carries lane `s` in bit `s`).
+    let input_vals = ec.layers[0].input_vals.clone();
+    let input_vals_bytes: Vec<u8> = input_vals
+        .iter()
+        .map(|e| {
+            let lanes = e.unpack();
+            let mut byte = 0u8;
+            for (s, lane) in lanes.iter().enumerate() {
+                byte |= (lane.v & 1) << s;
+            }
+            byte
+        })
+        .collect();
+
+    Ok(Rv32PreparedBatch { ec, num_vars: num_vars as u32, input_vals_bytes, blocks })
+}
+
+/// PHASE 2 of the SIMD-batched weld: open one GKR proof (attesting all 8 lanes)
+/// against an externally-supplied DA commitment, performing ZERO RS-encodes.
+pub fn rv32_prove_prepared_batch(
+    prepared: Rv32PreparedBatch,
+    da_root: [u8; 32],
+    extended: &[u8],
+) -> Result<Rv32BatchProof, String> {
+    let Rv32PreparedBatch { mut ec, num_vars, input_vals_bytes: _, blocks } = prepared;
+    let _prove_guard = prove_lock();
+    let timing = std::env::var("RV32_TIMING").ok().as_deref() == Some("1");
+
+    let installed = rsema1d_pcs::install_da_commitment_from_serialized(num_vars as usize, da_root, extended);
+    if installed != da_root {
+        rsema1d_pcs::clear_da_commitment();
+        return Err("reconstructed DA root != supplied DA root (batched)".into());
+    }
+
+    let mpi = MPIConfig::prover_new(None, None);
+    let encodes_before = rsema1d_sys::encode_call_count();
+    let tp = std::time::Instant::now();
+    let (claimed_v, proof) = executor::prove::<Rsema1dGKRConfig<'static>>(&mut ec, mpi.clone());
+    if timing { eprintln!("[timing]   gkr_prove (8 lanes): {}ms", tp.elapsed().as_millis()); }
+    let verified = executor::verify::<Rsema1dGKRConfig<'static>>(&mut ec, mpi.clone(), &proof, &claimed_v)
+        && claimed_v.is_zero();
+    let encode_delta = rsema1d_sys::encode_call_count() - encodes_before;
+    if encode_delta != 0 {
+        rsema1d_pcs::clear_da_commitment();
+        return Err(format!("accidental-computer property violated: prover performed {encode_delta} RS-encode(s)"));
+    }
+    if !proof.bytes.windows(32).any(|w| w == da_root) {
+        rsema1d_pcs::clear_da_commitment();
+        return Err("DA commitment not embedded in proof (batched)".into());
+    }
+    rsema1d_pcs::clear_da_commitment();
+
+    Ok(Rv32BatchProof { commitment: da_root, verified, proof: proof.bytes, input_vars: num_vars, blocks })
 }
 
 #[cfg(test)]
@@ -612,6 +921,11 @@ mod tests {
         let pre_mem = vec![(0x200u32, 0u32)];
         let expected_sum = n * (n + 1) / 2; // 6
 
+        // Hold the prove-lock across this test's manual encode + prove so the
+        // global encode-call counter is not perturbed by other tests running in
+        // parallel (prove_rv32_block does this internally; here we do it by hand).
+        let _prove_guard = prove_lock();
+
         // PHASE 1: prepare (no encode, no prove).
         let prepared = rv32_prepare(&prog, 0, &input, &pre_regs, &pre_mem, STEPS).unwrap();
         let num_vars = prepared.num_vars as usize;
@@ -654,5 +968,44 @@ mod tests {
             encode_delta, 0,
             "prover performed {encode_delta} RS-encode(s) in phase 2 (expected 0)"
         );
+    }
+
+    /// SIMD-batched prove: three DISTINCT, CHAINED sub-blocks packed into the GF2x8
+    /// lanes prove in one GKR proof. Asserts (a) verified, (b) each lane's output
+    /// matches its own emulator golden, and (c) the lanes are genuinely independent
+    /// (distinct post-roots), i.e. no lane leaked into another.
+    #[test]
+    fn rv32_blocks_simd_batched_distinct_lanes() {
+        // "sum 1..=n" writing the running total to the state slot 0x200.
+        let prog = vec![
+            addi(1, 0, 0),
+            addi(2, 0, 1),
+            lw(3, 0, INPUT_ADDR as i32),
+            add(1, 1, 2),
+            addi(2, 2, 1),
+            bge(3, 2, -8),
+            sw(1, 0, 0x200),
+            jal(0, 0),
+        ];
+        let pre_regs = [0u32; 32];
+        let pre_mem = vec![(0x200u32, 0u32)]; // the (declared) state region
+        // Small n so each lane's sum completes within the default STEPS (=16); the
+        // three lanes still produce distinct sums (1, 3, 6) and distinct roots.
+        let ns = [1u32, 2, 3];
+        let inputs: Vec<Vec<u8>> = ns.iter().map(|n| n.to_le_bytes().to_vec()).collect();
+
+        let bp = prove_rv32_blocks_simd(&prog, 0, &inputs, &pre_regs, &pre_mem, STEPS)
+            .expect("batched prove failed");
+
+        assert!(bp.verified, "batched GKR self-verify failed");
+        assert_eq!(bp.blocks.len(), ns.len(), "one result per real lane");
+        for (i, &n) in ns.iter().enumerate() {
+            let expected = (n * (n + 1) / 2).to_le_bytes().to_vec();
+            assert_eq!(bp.blocks[i].output, expected, "lane {i} output != sum(1..={n})");
+        }
+        // Genuinely independent executions: all three post-roots differ.
+        use std::collections::BTreeSet;
+        let roots: BTreeSet<_> = bp.blocks.iter().map(|b| b.post_root).collect();
+        assert_eq!(roots.len(), ns.len(), "lanes must have distinct post-roots");
     }
 }

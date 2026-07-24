@@ -367,18 +367,6 @@ ui-down:
 	-@rm -f $(ACCIDENTAL_RUNDIR)/api.pid $(ACCIDENTAL_RUNDIR)/dashboard.pid
 .PHONY: ui-down
 
-## simulate-txs: Send a continuous cast-based tx loop to the local reth rollup RPC on port 8545. Alternative tx driver to the spamoor service. Requires foundry (cast).
-simulate-txs:
-	@echo "--> Sending txs to http://localhost:8545 every second (Ctrl-C to stop)"
-	@while true; do \
-		cast send \
-			--rpc-url http://localhost:8545 \
-			--private-key 0x82bfcfadbf1712f6550d8d2c00a39f05b33ec78939d0167be2a737d691f33a6a \
-			--value 1 \
-			0x000000000000000000000000000000000000dEaD || true; \
-		sleep 1; \
-	done
-.PHONY: simulate-txs
 
 ## dashboard-api: Run the accidental-computer commitment/verification API server on :8088 (serves real rsema1d commitments + verifications).
 dashboard-api:

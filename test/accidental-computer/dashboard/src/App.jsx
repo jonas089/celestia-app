@@ -74,6 +74,10 @@ export default function App() {
 function Header({ conn, lastUpdated, rollupName, rollupNS, daNamespace, group, blocks }) {
   const proved = blocks.filter((b) => b.status === 'proved')
   const totalCycles = blocks.reduce((s, b) => s + (b.numCycles || 0), 0)
+  const totalTx = blocks.reduce((s, b) => s + (b.numTx || 0), 0)
+  // avg per-block throughput over proved blocks (transactions / prove time)
+  const tps = proved.reduce((s, b) => s + (b.elapsedMs > 0 ? (b.numTx || 0) * 1000 / b.elapsedMs : 0), 0)
+  const avgTps = proved.length ? tps / proved.length : 0
   const avgMs = proved.length
     ? Math.round(proved.reduce((s, b) => s + (b.elapsedMs || 0), 0) / proved.length)
     : null
@@ -81,6 +85,8 @@ function Header({ conn, lastUpdated, rollupName, rollupNS, daNamespace, group, b
     { label: 'blocks', value: group?.blockCount ?? blocks.length },
     { label: 'proved', value: group?.provedCount ?? proved.length },
     { label: 'GKR verified', value: group?.verifiedCount ?? blocks.filter((b) => b.verified).length },
+    { label: 'transactions', value: totalTx.toLocaleString() },
+    { label: 'avg TPS', value: avgTps > 0 ? avgTps.toFixed(2) : '—' },
     { label: 'vm cycles', value: totalCycles.toLocaleString() },
     { label: 'avg prove', value: avgMs != null ? fmtDuration(avgMs) : '—' },
   ]

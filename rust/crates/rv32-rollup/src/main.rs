@@ -30,7 +30,9 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use riscv_stf::rv32_prove::{prove_rv32_block, rv32_prepare, rv32_prove_prepared, Rv32Proof};
+use riscv_stf::rv32_prove::{
+    prove_rv32_blocks_simd, rv32_prepare_batch, rv32_prove_prepared_batch, Rv32BatchProof,
+};
 use serde_json::{json, Value};
 
 const BLOCK_SECS: u64 = 60; // one block per minute
@@ -129,6 +131,8 @@ struct BlockRecord {
     rust_source: String,  // simple no_std Rust source the program was compiled from
     pre_root: String,     // register-state root before execution (bound in-circuit)
     post_root: String,    // register-state root after execution (bound in-circuit)
+    num_tx: u32,          // transactions in this block (summed over all SIMD lanes)
+    num_lanes: u32,       // GF2x8 SIMD lanes carrying distinct sub-blocks (1..=8)
 }
 impl BlockRecord {
     fn to_json(&self) -> Value {
@@ -148,6 +152,8 @@ impl BlockRecord {
             "output": self.output,
             "stfStateRoot": self.post_state_root,
             "numCycles": self.num_cycles,
+            "numTx": self.num_tx,
+            "numLanes": self.num_lanes,
             "inputVars": self.input_vars,
             "proofBytes": self.proof_bytes,
             "elapsedMs": self.elapsed_ms as u64,
@@ -314,31 +320,21 @@ struct FibreCfg {
     namespace: String,
 }
 
-/// Result of one fibre DA + prove round: the GKR proof (opened against the
-/// on-chain commitment) plus the REAL settlement facts from the upload tool.
-struct FibreOutcome {
-    proof: Rv32Proof,
+/// The DA-side settlement facts + the serialized extended matrix, produced by the
+/// fibre upload CLI (encode square ONCE, upload, settle MsgPayForFibre on-chain).
+struct FibreUpload {
+    commitment: [u8; 32],
     da_height: u64,
     tx_hash: String,
     blob_id: String,
+    extended: Vec<u8>,
 }
 
-/// PHASE 1 (prepare, no encode) → run the fibre upload CLI (encode+upload+settle)
-/// → PHASE 2 (`rv32_prove_prepared`, opens against the settled commitment; asserts
-/// the prover did ZERO RS-encode). Any failure is surfaced as an Err (never faked).
-fn fibre_prove(
-    cfg: &FibreCfg,
-    program: &[u32],
-    input: &[u8],
-    pre_regs: &[u32; 32],
-    pre_mem: &[(u32, u32)],
-) -> Result<FibreOutcome, String> {
-    // 1) prepare: build circuit + solve witness, NO encode.
-    let prepared = rv32_prepare(program, PROGRAM_BASE, input, pre_regs, pre_mem, MAX_CYCLES)?;
-    let num_vars = prepared.num_vars;
-
-    // 2) write input-vals to a temp file and exec the fibre upload CLI, which
-    //    encodes the square ONCE, uploads it, and settles MsgPayForFibre on-chain.
+/// Hand the input-layer bytes to the external fibre uploader (encode+upload+settle)
+/// and return the settled commitment + extended matrix. Shared by the single-block
+/// and 8-lane SIMD-batched prove paths (the input-layer format is identical; the
+/// GF2x8 packing already carries all 8 lanes).
+fn fibre_upload(cfg: &FibreCfg, input_vals_bytes: &[u8], num_vars: u32) -> Result<FibreUpload, String> {
     let pid = std::process::id();
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -347,50 +343,35 @@ fn fibre_prove(
     let tmp_dir = std::env::temp_dir();
     let vals_path = tmp_dir.join(format!("rv32-fibre-vals-{pid}-{ts}.bin"));
     let ext_path = tmp_dir.join(format!("rv32-fibre-ext-{pid}-{ts}.bin"));
-    std::fs::write(&vals_path, &prepared.input_vals_bytes)
+    std::fs::write(&vals_path, input_vals_bytes)
         .map_err(|e| format!("write input-vals temp file: {e}"))?;
 
-    let run = |vals: &std::path::Path, ext: &std::path::Path| -> Result<std::process::Output, String> {
-        std::process::Command::new(&cfg.upload_bin)
-            .arg("--input-vals-file").arg(vals)
-            .arg("--num-vars").arg(num_vars.to_string())
-            .arg("--extended-out").arg(ext)
-            .arg("--namespace").arg(&cfg.namespace)
-            .arg("--grpc-addr").arg(&cfg.grpc_addr)
-            .arg("--chain-id").arg(&cfg.chain_id)
-            .arg("--key-name").arg(&cfg.key_name)
-            .arg("--keyring-backend").arg(&cfg.keyring_backend)
-            .arg("--home").arg(&cfg.home)
-            .output()
-            .map_err(|e| format!("exec {}: {e}", cfg.upload_bin))
-    };
-    let out = run(&vals_path, &ext_path);
+    let out = std::process::Command::new(&cfg.upload_bin)
+        .arg("--input-vals-file").arg(&vals_path)
+        .arg("--num-vars").arg(num_vars.to_string())
+        .arg("--extended-out").arg(&ext_path)
+        .arg("--namespace").arg(&cfg.namespace)
+        .arg("--grpc-addr").arg(&cfg.grpc_addr)
+        .arg("--chain-id").arg(&cfg.chain_id)
+        .arg("--key-name").arg(&cfg.key_name)
+        .arg("--keyring-backend").arg(&cfg.keyring_backend)
+        .arg("--home").arg(&cfg.home)
+        .output()
+        .map_err(|e| format!("exec {}: {e}", cfg.upload_bin));
     let out = match out {
         Ok(o) => o,
-        Err(e) => {
-            let _ = std::fs::remove_file(&vals_path);
-            return Err(e);
-        }
+        Err(e) => { let _ = std::fs::remove_file(&vals_path); return Err(e); }
     };
     if !out.status.success() {
         let _ = std::fs::remove_file(&vals_path);
-        return Err(format!(
-            "fibre upload exited {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        return Err(format!("fibre upload exited {}: {}", out.status, String::from_utf8_lossy(&out.stderr).trim()));
     }
-    // The tool prints logs to stderr and a single JSON object to stdout.
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let json_line = stdout
-        .lines()
-        .rev()
-        .find(|l| l.trim_start().starts_with('{'))
+    let json_line = stdout.lines().rev().find(|l| l.trim_start().starts_with('{'))
         .ok_or_else(|| format!("no JSON in fibre upload stdout: {stdout}"))?;
     let v: Value = serde_json::from_str(json_line)
         .map_err(|e| format!("parse fibre upload JSON: {e}: {json_line}"))?;
-    let commitment_hex = v.get("commitment").and_then(|x| x.as_str())
-        .ok_or("fibre upload JSON missing commitment")?;
+    let commitment_hex = v.get("commitment").and_then(|x| x.as_str()).ok_or("fibre upload JSON missing commitment")?;
     let commitment_bytes = hex_decode(commitment_hex)?;
     if commitment_bytes.len() != 32 {
         let _ = std::fs::remove_file(&vals_path);
@@ -398,29 +379,35 @@ fn fibre_prove(
     }
     let mut commitment = [0u8; 32];
     commitment.copy_from_slice(&commitment_bytes);
-    let da_height = v.get("daHeight").and_then(|x| x.as_u64())
-        .ok_or("fibre upload JSON missing daHeight")?;
+    let da_height = v.get("daHeight").and_then(|x| x.as_u64()).ok_or("fibre upload JSON missing daHeight")?;
     let tx_hash = v.get("txHash").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let blob_id = v.get("blobId").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let extended_file = v.get("extendedFile").and_then(|x| x.as_str())
-        .map(|s| s.to_string())
+    let extended_file = v.get("extendedFile").and_then(|x| x.as_str()).map(|s| s.to_string())
         .unwrap_or_else(|| ext_path.to_string_lossy().into_owned());
-
-    // 3) read the serialized extended matrix (exact bytes rv32_prove_prepared
-    //    consumes) and OPEN the GKR proof against the settled commitment.
-    let extended = std::fs::read(&extended_file)
-        .map_err(|e| format!("read extended matrix {extended_file}: {e}"));
-    // best-effort temp cleanup
+    let extended = std::fs::read(&extended_file).map_err(|e| format!("read extended matrix {extended_file}: {e}"));
     let _ = std::fs::remove_file(&vals_path);
     let extended = match extended {
         Ok(b) => b,
         Err(e) => { let _ = std::fs::remove_file(&ext_path); return Err(e); }
     };
-    let proof_res = rv32_prove_prepared(prepared, commitment, &extended);
     let _ = std::fs::remove_file(&ext_path);
-    let proof = proof_res?;
+    Ok(FibreUpload { commitment, da_height, tx_hash, blob_id, extended })
+}
 
-    Ok(FibreOutcome { proof, da_height, tx_hash, blob_id })
+/// SIMD-batched fibre round: prepare up to 8 chained sub-blocks (one per GF2x8
+/// lane), settle the single (8-lane) input square via the fibre CLI, and open ONE
+/// GKR proof against it. ~8x the transactions per proof at ~1x the prover cost.
+fn fibre_prove_batch(
+    cfg: &FibreCfg,
+    program: &[u32],
+    inputs: &[Vec<u8>],
+    pre_regs: &[u32; 32],
+    pre_mem: &[(u32, u32)],
+) -> Result<(Rv32BatchProof, u64, String, String), String> {
+    let prepared = rv32_prepare_batch(program, PROGRAM_BASE, inputs, pre_regs, pre_mem, MAX_CYCLES)?;
+    let up = fibre_upload(cfg, &prepared.input_vals_bytes, prepared.num_vars)?;
+    let proof = rv32_prove_prepared_batch(prepared, up.commitment, &up.extended)?;
+    Ok((proof, up.da_height, up.tx_hash, up.blob_id))
 }
 
 // --------------------------------------------------------------------------
@@ -487,16 +474,14 @@ fn block_worker(rx: std::sync::mpsc::Receiver<Submission>, cache: Cache) {
                     tx_hash: String::new(), blob_id: String::new(),
                     program_name: sub.name.clone(), rust_source: sub.source.clone(),
                     pre_root: String::new(), post_root: String::new(),
+                    num_tx: 0, num_lanes: 0,
                 });
             }
-            eprintln!("rv32-rollup: block #{h}: executing + proving ({} instrs, {} input bytes)", sub.program.len(), sub.input.len());
             let t0 = Instant::now();
             let pre_regs = state.regs;
-            // pre_mem = the PERSISTENT ROLLUP STATE only. The rollup state lives
-            // in the balance/key region [0x2000, 0x4000); everything else (the
-            // per-block tx input at 0x100.., prover dummy slots) is transient and
-            // must NOT accumulate across blocks. Carry only the state region, then
-            // apply this submission's declared slots (block-1 genesis seeding).
+            // pre_mem = the PERSISTENT ROLLUP STATE only (balance/key region
+            // [0x2000, 0x4000)); everything else is transient. Carry the state
+            // region, then apply this submission's declared slots (genesis seeding).
             let mut merged: BTreeMap<u32, u32> = state
                 .mem
                 .iter()
@@ -507,20 +492,34 @@ fn block_worker(rx: std::sync::mpsc::Receiver<Submission>, cache: Cache) {
                 merged.insert(*a, *v);
             }
             let pre_mem: Vec<(u32, u32)> = merged.into_iter().collect();
-            // Select the DA/prove mechanism. FIBRE-REUSE mode: the prover PREPARES
-            // (no encode), the fibre CLI encodes+uploads+settles the commitment
-            // on-chain, and the prover opens the GKR proof against that exact
-            // commitment (zero prover-side encode). Otherwise: internal-encode
-            // (prove_rv32_block) + best-effort bridge da_submit (unchanged).
-            let (res, fibre_da): (Result<Rv32Proof, String>, Option<(u64, String, String)>) =
+
+            // SIMD-BATCH the block: expand a transfer submission into 8 DISTINCT,
+            // CHAINED sub-blocks (one per GF2x8 lane), proven in ONE GKR proof at
+            // ~1x the cost -> ~8x transactions per proof. Lane l runs a sender-ring
+            // rotated by l over lane (l-1)'s post-state; the persistent state
+            // advances to the last lane's post. Genesis (no txs) stays a single lane.
+            let n = batch_n(&sub.input);
+            let lanes: Vec<Vec<u8>> = if sub.name == "transactions" && n > 0 {
+                (0..8u32).map(|l| tx_batch_lane(n, l)).collect()
+            } else {
+                vec![sub.input.clone()]
+            };
+            let num_lanes = lanes.len() as u32;
+            let total_tx: u32 = lanes.iter().map(|inp| batch_n(inp)).sum();
+            eprintln!("rv32-rollup: block #{h}: executing + proving ({} instrs, {num_lanes} lanes, {total_tx} tx)", sub.program.len());
+
+            // FIBRE-REUSE mode: prepare (no encode) -> fibre CLI encodes+uploads+
+            // settles the (8-lane) commitment on-chain -> open the GKR proof against
+            // it (zero prover-side encode). Otherwise: internal single-encode batch.
+            let (res, fibre_da): (Result<Rv32BatchProof, String>, Option<(u64, String, String)>) =
                 if let Some(cfg) = &fibre_cfg {
-                    match fibre_prove(cfg, &sub.program, &sub.input, &pre_regs, &pre_mem) {
-                        Ok(o) => (Ok(o.proof), Some((o.da_height, o.tx_hash, o.blob_id))),
+                    match fibre_prove_batch(cfg, &sub.program, &lanes, &pre_regs, &pre_mem) {
+                        Ok((bp, dh, tx, bid)) => (Ok(bp), Some((dh, tx, bid))),
                         Err(e) => (Err(e), None),
                     }
                 } else {
                     (
-                        prove_rv32_block(&sub.program, PROGRAM_BASE, &sub.input, &pre_regs, &pre_mem, MAX_CYCLES),
+                        prove_rv32_blocks_simd(&sub.program, PROGRAM_BASE, &lanes, &pre_regs, &pre_mem, MAX_CYCLES),
                         None,
                     )
                 };
@@ -530,16 +529,19 @@ fn block_worker(rx: std::sync::mpsc::Receiver<Submission>, cache: Cache) {
             rec.elapsed_ms = elapsed;
             rec.proved_unix = now_unix();
             match res {
-                Ok(p) => {
-                    // advance persistent state
-                    state.apply(p.post_regs, &p.post_mem);
+                Ok(bp) => {
+                    let first = bp.blocks.first().expect("batch has >=1 lane");
+                    let last = bp.blocks.last().expect("batch has >=1 lane");
+                    // advance persistent state via the chained end (last lane)
+                    state.apply(last.post_regs, &last.post_mem);
                     let post_root = state_digest(&state.regs, &state.mem);
+                    let total_cycles: u32 = bp.blocks.iter().map(|b| b.num_cycles).sum();
                     // DA height: in fibre mode it is the REAL on-chain settlement
                     // height; otherwise post the block DATA to the bridge (best-effort).
                     let da_h = match &fibre_da {
                         Some((h_da, _, _)) => *h_da,
                         None => {
-                            let blob = block_blob(&sub.program, &sub.input, &p.output, &post_root, p.num_cycles);
+                            let blob = block_blob(&sub.program, &sub.input, &last.output, &post_root, total_cycles);
                             if token.is_empty() { 0 } else {
                                 match da_submit(&bridge, &token, &namespace, &blob) {
                                     Ok(hh) => hh,
@@ -549,24 +551,25 @@ fn block_worker(rx: std::sync::mpsc::Receiver<Submission>, cache: Cache) {
                         }
                     };
                     rec.status = "proved".into();
-                    rec.verified = p.verified;
-                    rec.commitment = hexs(&p.commitment);
+                    rec.verified = bp.verified;
+                    rec.commitment = hexs(&bp.commitment);
                     rec.da_height = da_h;
-                    rec.output = hexs(&p.output);
+                    rec.output = hexs(&last.output);
                     rec.post_state_root = hexs(&post_root);
-                    rec.num_cycles = p.num_cycles;
-                    rec.input_vars = p.input_vars;
-                    rec.proof_bytes = p.proof.len();
-                    rec.pre_root = hexs(&p.pre_root);
-                    rec.post_root = hexs(&p.post_root);
+                    rec.num_cycles = total_cycles;
+                    rec.num_tx = total_tx;
+                    rec.num_lanes = num_lanes;
+                    rec.input_vars = bp.input_vars;
+                    rec.proof_bytes = bp.proof.len();
+                    rec.pre_root = hexs(&first.pre_root);
+                    rec.post_root = hexs(&last.post_root);
                     if let Some((_, tx, bid)) = &fibre_da {
                         rec.tx_hash = tx.clone();
                         rec.blob_id = bid.clone();
                     }
                     let mode = if fibre_da.is_some() { "fibre" } else { "internal" };
-                    eprintln!("rv32-rollup: block #{h} PROVED ({mode}) verified={} cycles={} commit={} daHeight={} tx={} in {}ms",
-                        p.verified, p.num_cycles, &rec.commitment[..18.min(rec.commitment.len())], da_h, rec.tx_hash, elapsed);
-                    let _: &Rv32Proof = &p;
+                    eprintln!("rv32-rollup: block #{h} PROVED ({mode}) verified={} lanes={num_lanes} tx={total_tx} cycles={total_cycles} commit={} daHeight={} in {}ms",
+                        bp.verified, &rec.commitment[..18.min(rec.commitment.len())], da_h, elapsed);
                 }
                 Err(e) => {
                     rec.status = "failed".into();
@@ -729,14 +732,16 @@ fn genesis_state() -> Vec<(u32, u32)> {
     mem
 }
 
-/// A block of `n` valid signed transfers (1 unit each, round-robin), encoded as
-/// input bytes: [N, (sender,recipient,amount,sig) * N].
-fn tx_batch(n: u32) -> Vec<u8> {
+/// A block of `n` valid signed transfers (1 unit each, round-robin) for SIMD lane
+/// `lane`, encoded as input bytes: [N, (sender,recipient,amount,sig) * N]. The
+/// sender/recipient ring is rotated by `lane` so each of the 8 batched lanes is a
+/// DISTINCT set of transfers (chained: lane l runs over lane l-1's post-state).
+fn tx_batch_lane(n: u32, lane: u32) -> Vec<u8> {
     let mut input = Vec::new();
     input.extend_from_slice(&n.to_le_bytes());
     for i in 0..n {
-        let s = i % TX_ACCOUNTS;
-        let r = (i + 1) % TX_ACCOUNTS;
+        let s = (i + lane) % TX_ACCOUNTS;
+        let r = (i + lane + 1) % TX_ACCOUNTS;
         let amt = 1u32;
         let sig = mac(key_of(s), s, r, amt);
         for v in [s, r, amt, sig] {
@@ -744,6 +749,21 @@ fn tx_batch(n: u32) -> Vec<u8> {
         }
     }
     input
+}
+
+/// Lane-0 transfer batch (used for `emit-sample`; the rollup expands each block to
+/// 8 distinct lanes at prove time).
+fn tx_batch(n: u32) -> Vec<u8> {
+    tx_batch_lane(n, 0)
+}
+
+/// Number of transactions `N` encoded in a batch input (its first LE word).
+fn batch_n(input: &[u8]) -> u32 {
+    if input.len() >= 4 {
+        u32::from_le_bytes([input[0], input[1], input[2], input[3]])
+    } else {
+        0
+    }
 }
 
 fn main() {

@@ -372,38 +372,52 @@ pub fn step<C: Config>(api: &mut impl RootAPI<C>, st: Rv32State, program: &[W], 
     }
     new_regs[0] = zeros(api, XLEN);
 
-    // --- STORE: RMW per slot, write to the matching slot only ---
+    // --- STORE: hoisted RMW. The old code recomputed the SB/SH sub-word patch
+    // for EVERY committed slot inside the loop (O(mem_slots) copies of identical,
+    // slot-independent logic). Instead: read the current word at the store address
+    // ONCE via a scan (sharing the hit-test with the write-back), build the SB/SH/SW
+    // store word ONCE, then the per-slot loop is just hit-test + a 32-bit select.
     let saddr = add32(api, &rs1_val, &s_imm);
     let swidx: Vec<Variable> = (2..2 + cfg.waddr_bits).map(|i| saddr[i]).collect();
     let sbyte_idx: Vec<Variable> = saddr[0..2].to_vec();
     let shalf_sel = saddr[1];
     let rs2_byte: Vec<Variable> = rs2_val[0..8].to_vec();
     let rs2_half: Vec<Variable> = rs2_val[0..16].to_vec();
+    // Shared scan: per-slot hit against the store address + current word there.
+    let mut shit: Vec<Variable> = Vec::with_capacity(cfg.mem_slots);
+    let mut cur_s = zeros(api, XLEN);
+    for j in 0..cfg.mem_slots {
+        let h = eq(api, &swidx, &st.mem_addr[j]);
+        for b in 0..XLEN {
+            let t = api.mul(h, st.mem_val[j][b]);
+            cur_s[b] = api.add(cur_s[b], t);
+        }
+        shit.push(h);
+    }
+    // SB: replace byte at sbyte_idx of the target word.
+    let mut sb_word = cur_s.clone();
+    for k in 0..4 {
+        let sel = eq_const(api, &sbyte_idx, k as u32);
+        for b in 0..8 {
+            sb_word[k * 8 + b] = bit_select(api, sel, rs2_byte[b], sb_word[k * 8 + b]);
+        }
+    }
+    // SH: replace half at shalf_sel of the target word.
+    let not_h = api.sub(1, shalf_sel);
+    let mut sh_word = cur_s.clone();
+    for b in 0..16 {
+        sh_word[b] = bit_select(api, not_h, rs2_half[b], sh_word[b]);
+        sh_word[16 + b] = bit_select(api, shalf_sel, rs2_half[b], sh_word[16 + b]);
+    }
+    // SW default (f3==2); SB (f3==0) / SH (f3==1) by funct3.
+    let mut store_word = rs2_val.clone();
+    store_word = select(api, f3_0, &sb_word, &store_word);
+    store_word = select(api, f3_1, &sh_word, &store_word);
+    // Write the (single) store word to the matching slot iff this is a store.
     let mut new_mem_val = st.mem_val.clone();
     for j in 0..cfg.mem_slots {
-        let cur = st.mem_val[j].clone();
-        // SB: replace byte at sbyte_idx
-        let mut sb_word = cur.clone();
-        for k in 0..4 {
-            let sel = eq_const(api, &sbyte_idx, k as u32);
-            for b in 0..8 {
-                sb_word[k * 8 + b] = bit_select(api, sel, rs2_byte[b], sb_word[k * 8 + b]);
-            }
-        }
-        // SH: replace half at shalf_sel
-        let not_h = api.sub(1, shalf_sel);
-        let mut sh_word = cur.clone();
-        for b in 0..16 {
-            sh_word[b] = bit_select(api, not_h, rs2_half[b], sh_word[b]);
-            sh_word[16 + b] = bit_select(api, shalf_sel, rs2_half[b], sh_word[16 + b]);
-        }
-        // SW / SB / SH select by funct3
-        let mut store_word = rs2_val.clone(); // f3 == 2 (SW)
-        store_word = select(api, f3_0, &sb_word, &store_word);
-        store_word = select(api, f3_1, &sh_word, &store_word);
-        let hit = eq(api, &swidx, &st.mem_addr[j]);
-        let do_store = api.mul(hit, is_store);
-        new_mem_val[j] = select(api, do_store, &store_word, &cur);
+        let do_store = api.mul(shit[j], is_store);
+        new_mem_val[j] = select(api, do_store, &store_word, &st.mem_val[j]);
     }
 
     Rv32State { regs: new_regs, pc: npc, mem_addr: st.mem_addr, mem_val: new_mem_val }

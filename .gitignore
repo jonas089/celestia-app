@@ -57,3 +57,6 @@ test/accidental-computer/testnet/ev-node/config/signer.json
 test/accidental-computer/testnet/ev-node/config/passphrase.txt
 test/accidental-computer/testnet/ev-node/config/jwt.hex
 test/accidental-computer/testnet/reth/jwt.hex
+
+# accidental-computer local runtime artifacts
+test/accidental-computer/.run/

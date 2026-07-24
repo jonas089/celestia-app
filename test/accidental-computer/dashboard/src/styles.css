@@ -237,6 +237,7 @@ code { font-family: var(--mono); }
 .chip--flag { color: var(--accent2); border-color: rgba(99,230,190,0.25); background: rgba(99,230,190,0.06); }
 .chip--prog { color: #cbd4e8; background: rgba(255,255,255,0.03); font-weight: 600; }
 .chip--total { color: var(--ink); }
+.chip--tx { color: var(--accent); border-color: rgba(122,162,247,0.35); background: rgba(122,162,247,0.10); font-weight: 700; }
 
 /* metrics grid */
 .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 11px; margin-top: 15px; }
