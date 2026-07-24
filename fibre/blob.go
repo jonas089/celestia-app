@@ -61,16 +61,16 @@ func DefaultBlobConfigV0() BlobConfig {
 
 // v1 (rv32 GKR square) erasure shape. Unlike v0, the committed rows ARE the
 // rsema1d square produced by [rsema1d.EncodeGKRInputSquare]: the rv32 GKR
-// prover commits an rsema1d square with K=N (num_vars=11 => K=512, N=512) and a
-// fixed row length of one Leopard chunk (64 bytes), with NO 5-byte v0 blob
+// prover commits an rsema1d square with K=N (num_vars=13 => K=2048, N=2048) and
+// a fixed row length of one Leopard chunk (64 bytes), with NO 5-byte v0 blob
 // header. v1 therefore must not re-encode or prepend a header — the on-chain
-// commitment must equal the prover's exact commitment. The rv32 circuit shape
-// is constant, so v1 is a single fixed config.
+// commitment must equal the prover's exact commitment. The transaction-contract
+// input layer is num_vars=13, so v1 is a single fixed config at that shape.
 const (
-	// blobV1OriginalRows is K for the rv32 GKR square (1<<(numVars-2), numVars=11).
-	blobV1OriginalRows = 512
+	// blobV1OriginalRows is K for the rv32 GKR square (1<<(numVars-2), numVars=13).
+	blobV1OriginalRows = 2048
 	// blobV1ParityRows is N for the rv32 GKR square (K=N).
-	blobV1ParityRows = 512
+	blobV1ParityRows = 2048
 	// blobV1RowLen is the fixed row length in bytes (one Leopard chunk, gkrRowBytes).
 	blobV1RowLen = 64
 )
