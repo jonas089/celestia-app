@@ -3,7 +3,7 @@ import { api, ApiError, API_BASE } from './api.js'
 import { RollupFeed } from './components/BlockProofs.jsx'
 import { CopyButton } from './components/CopyButton.jsx'
 import {
-  truncHex, fmtDuration, timeAgo, makeProgramLabeler,
+  truncHex, fmtDuration, timeAgo,
 } from './util.js'
 
 const POLL_MS = 2000
@@ -189,35 +189,32 @@ function VmStatePanel({ blocks }) {
 
 function ProgramsPanel({ blocks }) {
   const programs = useMemo(() => {
-    const label = makeProgramLabeler()
     const map = new Map()
-    // iterate oldest→newest so labels are assigned in first-seen order
-    for (const b of [...blocks].reverse()) {
+    for (const b of blocks) {
       const hex = b.program
       if (!hex) continue
       if (!map.has(hex)) {
-        const { name, idx } = label(hex)
-        map.set(hex, { hex, name: b.programName || name, idx, runs: 0, lastBlock: 0, lastOutput: '' })
+        map.set(hex, { hex, name: b.programName || 'program', runs: 0, lastBlock: 0 })
       }
       const e = map.get(hex)
       e.runs++
-      if ((b.blockNumber || 0) >= e.lastBlock) { e.lastBlock = b.blockNumber || 0; e.lastOutput = b.output }
+      if ((b.blockNumber || 0) >= e.lastBlock) e.lastBlock = b.blockNumber || 0
     }
-    return [...map.values()].sort((a, b) => a.idx - b.idx)
+    return [...map.values()]
   }, [blocks])
 
   return (
     <div className="panel">
-      <div className="panel__head"><span className="panel__dot" /><h3>Deployed programs</h3></div>
-      {programs.length === 0 && <p className="muted" style={{ fontSize: 12.5, margin: '6px 0' }}>No programs executed yet.</p>}
+      <div className="panel__head"><span className="panel__dot" /><h3>Deployed contract</h3></div>
+      {programs.length === 0 && <p className="muted" style={{ fontSize: 12.5, margin: '6px 0' }}>No contract executed yet.</p>}
       {programs.map((p) => (
         <div className="prog" key={p.hex}>
-          <div className="prog__tag">{p.idx + 1}</div>
+          <div className="prog__tag">≡</div>
           <div className="prog__body">
             <div className="prog__name">{p.name}</div>
             <div className="prog__meta mono">{truncHex(p.hex, 10, 6)} · {(p.hex.replace(/^0x/, '').length / 8) | 0} instrs</div>
           </div>
-          <div className="prog__runs">{p.runs} run{p.runs === 1 ? '' : 's'} · #{p.lastBlock}</div>
+          <div className="prog__runs">{p.runs} block{p.runs === 1 ? '' : 's'} · #{p.lastBlock}</div>
         </div>
       ))}
     </div>

@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import { CopyButton } from './CopyButton.jsx'
 import {
   truncHex, fmtBytes, fmtDuration, timeAgo,
-  hexToWordsLE, disasm, opClasses, makeProgramLabeler,
+  hexToWordsLE, disasm, opClasses,
 } from '../util.js'
 
 // Live, newest-first per-block proof feed for the rv32i accidental computer.
@@ -11,10 +11,9 @@ import {
 // expand into tabbed, scrollable detail (disassembly, I/O, proof, verify).
 export function RollupFeed({ blocks, rollupNS, scope, backendError }) {
   const labelOf = useMemo(() => {
-    const label = makeProgramLabeler()
     const m = new Map()
-    for (const b of [...blocks].reverse()) {
-      if (b.program && !m.has(b.program)) m.set(b.program, b.programName || label(b.program).name)
+    for (const b of blocks) {
+      if (b.program) m.set(b.program, b.programName || 'program')
     }
     return (hex) => m.get(hex) || 'program'
   }, [blocks])

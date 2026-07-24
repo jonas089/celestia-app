@@ -23,19 +23,42 @@ use crate::batch_keccak::keccak256_fixed;
 use crate::emulator::Cpu;
 use crate::rv32_circuit::{run, Rv32Cfg, Rv32State, W};
 
-// Committed-size bounds (fixed at circuit-compile time). Kept tight so the
-// circuit compiles + proves in a few minutes.
-const PROG_LEN: usize = 16; // committed program words
-const NREG: usize = 32; // RV32I register file
-const MEM_SLOTS: usize = 8; // bounded word-memory slots (input region + user + pad)
-const WADDR_BITS: usize = 16; // committed word-address width
-const STEPS: usize = 16; // unrolled interpreter steps (rollup default)
+// Committed-size bounds. PROG_LEN / MEM_SLOTS / STATE_SLOTS are set at COMPILE
+// time (declare_circuit! needs const array sizes) and are tunable via build-env
+// (RV32_PROG_LEN / RV32_MEM_SLOTS / RV32_STATE_SLOTS) so the tx-throughput
+// benchmark can size the circuit per batch without editing source. STEPS is a
+// runtime unroll count (RV32_STEPS), read before compile.
+const fn parse_usize(s: &str) -> usize {
+    let b = s.as_bytes();
+    let mut n = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        n = n * 10 + (b[i] - b'0') as usize;
+        i += 1;
+    }
+    n
+}
+const fn env_usize(v: Option<&str>, default: usize) -> usize {
+    match v {
+        Some(s) => parse_usize(s),
+        None => default,
+    }
+}
 
-/// Unrolled interpreter step count. Defaults to STEPS (the rollup's fixed 16);
-/// overridable via the RV32_STEPS env var for the gas-ceiling benchmark, which
-/// proves progressively larger circuits on the standalone path. Read once per
-/// prepare (before circuit compile), so the native emulator and the compiled
-/// circuit agree on the unroll depth.
+const PROG_LEN: usize = env_usize(option_env!("RV32_PROG_LEN"), 16); // committed program words
+const NREG: usize = 32; // RV32I register file
+const MEM_SLOTS: usize = env_usize(option_env!("RV32_MEM_SLOTS"), 8); // committed word-memory slots
+const WADDR_BITS: usize = 20; // committed word-address width (covers state at 0x2000/0x3000)
+const STEPS: usize = 16; // unrolled interpreter steps (rollup default)
+// The leading STATE_SLOTS committed memory slots are the ROLLUP STATE (balances
+// + keys). The in-circuit state root (pre_root/post_root) is keccak over exactly
+// these slots, so each block proves a balance-state transition prev -> new. The
+// input (txs) is committed AFTER the state region.
+const STATE_SLOTS: usize = env_usize(option_env!("RV32_STATE_SLOTS"), 1);
+
+/// Unrolled interpreter step count. Defaults to STEPS; overridable via RV32_STEPS
+/// (runtime) for the benchmark. Read once per prepare (before circuit compile),
+/// so the native emulator and the compiled circuit agree on the unroll depth.
 fn steps() -> usize {
     std::env::var("RV32_STEPS")
         .ok()
@@ -85,43 +108,46 @@ impl Define<GF2Config> for Rv32Circuit<Variable> {
         }
 
         // ---- genuine rollup state transition: bind pre_root / post_root ----
-        // State root = keccak256 over the 32 register words, each 4 LE bytes
-        // (128-byte preimage). Computed in-circuit so it is bound to the
-        // COMMITTED pre-state and the PROVEN post-state; chained across blocks by
-        // the sequencer feeding post_root(n) as pre_root(n+1).
-        let pre_bits = regs_to_bits(&self.pre_regs.iter().map(|r| r.to_vec()).collect::<Vec<_>>());
-        let pre_hash = keccak256_fixed(api, &pre_bits, NREG * 4);
+        // State root = keccak256 over the leading STATE_SLOTS committed memory
+        // VALUES (the rollup balance/key state), each 4 LE bytes. Computed
+        // IN-CIRCUIT and bound to the COMMITTED pre-state (`mem_val`) and the
+        // PROVEN post-state (`fin.mem_val`); chained across blocks by the
+        // sequencer feeding post_root(n) as pre_root(n+1).
+        let pre_state_slots: Vec<Vec<Variable>> =
+            (0..STATE_SLOTS).map(|i| self.mem_val[i].to_vec()).collect();
+        let pre_bits = slots_to_bits(&pre_state_slots);
+        let pre_hash = keccak256_fixed(api, &pre_bits, STATE_SLOTS * 4);
         for i in 0..256 {
             api.assert_is_equal(pre_hash[i], self.pre_root[i]);
         }
-        let post_bits = regs_to_bits(&fin.regs);
-        let post_hash = keccak256_fixed(api, &post_bits, NREG * 4);
+        let post_bits = slots_to_bits(&fin.mem_val[0..STATE_SLOTS]);
+        let post_hash = keccak256_fixed(api, &post_bits, STATE_SLOTS * 4);
         for i in 0..256 {
             api.assert_is_equal(post_hash[i], self.post_root[i]);
         }
     }
 }
 
-/// Flatten a register file (NREG words, each 32 bits LSB-first) into a keccak
-/// bit buffer: word i occupies bytes [4i, 4i+4) as little-endian, i.e. bit b of
-/// word i lands at msg bit i*32 + b. The native reference (`regs_root`) hashes
-/// the identical byte layout.
-fn regs_to_bits(regs: &[Vec<Variable>]) -> Vec<Variable> {
-    let mut bits = Vec::with_capacity(regs.len() * 32);
-    for r in regs {
+/// Flatten committed memory slot VALUES (each 32 bits LSB-first) into a keccak
+/// bit buffer: slot j occupies bytes [4j, 4j+4) little-endian, so bit b of slot
+/// j lands at msg bit j*32 + b. The native reference (`state_root`) hashes the
+/// identical byte layout.
+fn slots_to_bits(slots: &[Vec<Variable>]) -> Vec<Variable> {
+    let mut bits = Vec::with_capacity(slots.len() * 32);
+    for s in slots {
         for b in 0..32 {
-            bits.push(r[b]);
+            bits.push(s[b]);
         }
     }
     bits
 }
 
-/// Native reference for the in-circuit register-state root: keccak256 over the
-/// 32 register words as little-endian bytes (128-byte preimage). x0 is 0.
-fn regs_root(regs: &[u32; 32]) -> [u8; 32] {
-    let mut buf = [0u8; NREG * 4];
-    for i in 0..NREG {
-        buf[i * 4..i * 4 + 4].copy_from_slice(&regs[i].to_le_bytes());
+/// Native reference for the in-circuit state root: keccak256 over the first
+/// STATE_SLOTS memory-slot values as little-endian bytes (STATE_SLOTS*4 bytes).
+fn state_root(slot_values: &[u32]) -> [u8; 32] {
+    let mut buf = vec![0u8; STATE_SLOTS * 4];
+    for i in 0..STATE_SLOTS {
+        buf[i * 4..i * 4 + 4].copy_from_slice(&slot_values[i].to_le_bytes());
     }
     keccak256_native(&buf)
 }
@@ -223,21 +249,31 @@ pub fn rv32_prepare(
     }
     let n_input = input_words.len();
     let n_user = pre_mem.len();
-    let mut slots: Vec<(u32, u32)> = Vec::new();
-    for (k, w) in input_words.iter().enumerate() {
-        slots.push((INPUT_ADDR + 4 * (k as u32), *w));
+    if n_user > STATE_SLOTS {
+        return Err(format!("state slots {n_user} exceed STATE_SLOTS {STATE_SLOTS}"));
     }
+    let mut slots: Vec<(u32, u32)> = Vec::new();
+    let mut dummy = 0u32;
+    // STATE region [0, STATE_SLOTS): the rollup state (balances/keys). This is the
+    // region the in-circuit state root is taken over. Pad to STATE_SLOTS with
+    // disjoint dummy addresses so the rooted region is exactly the state.
     for &(a, v) in pre_mem {
         slots.push((a, v));
+    }
+    while slots.len() < STATE_SLOTS {
+        slots.push(((0xE0000u32.wrapping_add(dummy)) << 2, 0));
+        dummy += 1;
+    }
+    // INPUT region: the block's transactions, loaded at INPUT_ADDR.
+    for (k, w) in input_words.iter().enumerate() {
+        slots.push((INPUT_ADDR + 4 * (k as u32), *w));
     }
     let n_real = slots.len();
     if n_real > MEM_SLOTS {
         return Err(format!("too many memory slots: {} > {}", n_real, MEM_SLOTS));
     }
-    let mut dummy = 0u32;
     while slots.len() < MEM_SLOTS {
-        let addr = (0xF000u32.wrapping_add(dummy)) << 2; // word idx 0xF000+dummy, program-disjoint
-        slots.push((addr, 0));
+        slots.push(((0xF0000u32.wrapping_add(dummy)) << 2, 0));
         dummy += 1;
     }
     for &(a, _) in &slots {
@@ -280,11 +316,13 @@ pub fn rv32_prepare(
         .find(|r| r.next_pc == r.pc)
         .map(|r| r.cycle + 1)
         .unwrap_or(steps() as u32);
+    // Public output = the post-state (balances) region, now the leading slots.
     let mut output = Vec::new();
     for k in 0..n_user {
-        let v = post_mem_full[n_input + k].1;
+        let v = post_mem_full[k].1;
         output.extend_from_slice(&v.to_le_bytes());
     }
+    let _ = n_input;
     let post_mem: Vec<(u32, u32)> = post_mem_full[..n_real].to_vec();
 
     // --- compile + assign committed input + bind public golden ---
@@ -324,12 +362,12 @@ pub fn rv32_prepare(
             asg.post_mem[j][b] = ((v >> b) & 1).into();
         }
     }
-    // Genuine state-transition roots (register-file state). Committed pre-state
-    // has x0 = 0 (matching the circuit's committed pre_regs assignment above).
-    let mut pre_regs_committed = *pre_regs;
-    pre_regs_committed[0] = 0;
-    let pre_root = regs_root(&pre_regs_committed);
-    let post_root = regs_root(&post_regs);
+    // Genuine rollup state-transition roots over the STATE region (balances/keys):
+    // pre_root = keccak(initial state), post_root = keccak(final state).
+    let pre_state_vals: Vec<u32> = slots[0..STATE_SLOTS].iter().map(|&(_, v)| v).collect();
+    let post_state_vals: Vec<u32> = post_mem_full[0..STATE_SLOTS].iter().map(|&(_, v)| v).collect();
+    let pre_root = state_root(&pre_state_vals);
+    let post_root = state_root(&post_state_vals);
     for i in 0..32 {
         for j in 0..8 {
             asg.pre_root[i * 8 + j] = (((pre_root[i] >> j) & 1) as u32).into();

@@ -48,19 +48,6 @@ export function bandColor(i) {
   return BAND_COLORS[i % BAND_COLORS.length]
 }
 
-// Stable label (α, β, γ …) for a program keyed by its hex, assigned in the
-// order distinct programs are first observed.
-const GREEK = ['α', 'β', 'γ', 'δ', 'ε', 'ζ', 'η', 'θ', 'ι', 'κ']
-export function makeProgramLabeler() {
-  const seen = new Map()
-  return (hex) => {
-    if (!hex) return { name: '—', idx: 0 }
-    if (!seen.has(hex)) seen.set(hex, seen.size)
-    const idx = seen.get(hex)
-    return { name: `Program ${GREEK[idx % GREEK.length]}`, idx }
-  }
-}
-
 // ---- RV32IM disassembler (compact) --------------------------------------
 // Decodes the on-DA program (hex of little-endian u32 words) into readable
 // mnemonics. Covers the RV32I base + M extension the rollup's emulator runs.

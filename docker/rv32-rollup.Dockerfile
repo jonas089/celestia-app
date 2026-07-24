@@ -69,6 +69,12 @@ RUN CGO_ENABLED=0 go build -o /usr/local/bin/rv32-fibre-upload ./tools/rv32-fibr
 # WITH_CLI). RUSTFLAGS make the final link resolve librsema1d.so and libmpi at
 # link time (the -soname/SONAME references need -rpath-link on Linux; runtime
 # resolution is handled by LD_LIBRARY_PATH in stage 2).
+# Circuit dims for the deployed transaction contract (read by rustc via
+# option_env!): STATE_SLOTS=16 = 8 accounts x (balance+key); MEM_SLOTS=64 holds
+# the state + a per-block tx batch; PROG_LEN=64 fits the 45-word contract.
+ENV RV32_MEM_SLOTS=64 \
+    RV32_STATE_SLOTS=16 \
+    RV32_PROG_LEN=64
 RUN set -eux; \
     RSEMA1D_DIR=/build/celestia-app/rust/crates/rsema1d-sys/lib; \
     MPI_LIBDIR="$(mpicc --showme:libdirs | awk '{print $1}')"; \

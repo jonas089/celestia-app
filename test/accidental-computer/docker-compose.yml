@@ -205,9 +205,9 @@ services:
     networks:
       - accidental-net
 
-  # Injects the three sample rv32i programs (sum_1_to_n, add, increment) into the
-  # rollup every ~60s so blocks are non-empty. Reuses the rollup image (its
-  # `emit-sample` prints ready-to-submit JSON) and POSTs each as an rv32_submit.
+  # Drives the transaction rollup: deploys the genesis balance state (block 1),
+  # then submits a signed-transfer batch each interval. Reuses the rollup image
+  # (`emit-sample genesis` / `emit-sample txbatch N` print ready-to-submit JSON).
   submitter:
     image: rv32-rollup:accidental-local
     container_name: acc-rv32-submitter
@@ -221,15 +221,18 @@ services:
       - |
         set -eu
         RPC="http://rv32-rollup:8545"
+        submit() {
+          body="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"rv32_submit\",\"params\":[$$1]}"
+          curl -s -X POST "$$RPC" -H 'Content-Type: application/json' -d "$$body" >/dev/null || true
+        }
         echo "submitter: waiting for rollup RPC at $$RPC ..."
         until curl -s -o /dev/null "$$RPC"; do sleep 2; done
-        echo "submitter: rollup reachable; injecting samples every 60s"
+        echo "submitter: deploying genesis balance state"
+        submit "$$(rv32-rollup emit-sample genesis)"
+        sleep 60
+        echo "submitter: submitting a transaction batch every 60s"
         while true; do
-          rv32-rollup emit-sample | while IFS= read -r sample; do
-            [ -z "$$sample" ] && continue
-            body="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"rv32_submit\",\"params\":[$$sample]}"
-            curl -s -X POST "$$RPC" -H 'Content-Type: application/json' -d "$$body" >/dev/null || true
-          done
+          submit "$$(rv32-rollup emit-sample txbatch 4)"
           sleep 60
         done
     networks:

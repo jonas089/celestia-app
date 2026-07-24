@@ -492,17 +492,17 @@ fn block_worker(rx: std::sync::mpsc::Receiver<Submission>, cache: Cache) {
             eprintln!("rv32-rollup: block #{h}: executing + proving ({} instrs, {} input bytes)", sub.program.len(), sub.input.len());
             let t0 = Instant::now();
             let pre_regs = state.regs;
-            // pre_mem = persistent state slots merged with this submission's
-            // declared slots (submission overrides persistent on address clash).
-            let mut merged: BTreeMap<u32, u32> = state.mem.clone();
-            // The input region [0x100, 0x100+len) is per-block scratch, not
-            // persistent state. Drop any carried slots the input words will
-            // occupy so the prover's committed slots don't duplicate address
-            // 0x100.. and diverge from the native emulator (the carried-state bug).
-            let in_words = ((sub.input.len() + 3) / 4) as u32;
-            for k in 0..in_words {
-                merged.remove(&(0x100 + 4 * k));
-            }
+            // pre_mem = the PERSISTENT ROLLUP STATE only. The rollup state lives
+            // in the balance/key region [0x2000, 0x4000); everything else (the
+            // per-block tx input at 0x100.., prover dummy slots) is transient and
+            // must NOT accumulate across blocks. Carry only the state region, then
+            // apply this submission's declared slots (block-1 genesis seeding).
+            let mut merged: BTreeMap<u32, u32> = state
+                .mem
+                .iter()
+                .filter(|(a, _)| **a >= 0x2000 && **a < 0x4000)
+                .map(|(a, v)| (*a, *v))
+                .collect();
             for (a, v) in &sub.mem {
                 merged.insert(*a, *v);
             }
@@ -684,78 +684,84 @@ fn write_http(stream: &mut TcpStream, status: &str, body: &str) -> std::io::Resu
 // carried alongside so the explorer can show source + bytecode + proof. See
 // programs/*.rs and programs/README.md to regenerate.
 
-const SRC_SUM: &str = r#"#![no_std]
-#![no_main]
+// The Rust source of the deployed transaction contract (shown in the explorer).
+const SRC_TXPROC: &str = include_str!("../programs/txproc.rs");
 
-// sum 1..=n : n is read from mem[0x100], result written to mem[0x200].
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
-    let n = unsafe { core::ptr::read_volatile(0x100 as *const u32) };
-    let mut acc: u32 = 0;
-    let mut i: u32 = 1;
-    while i <= n {
-        acc = acc.wrapping_add(i);
-        i += 1;
+// Compiled `programs/txproc` (simple no_std Rust -> riscv32im, opt-level=3;
+// stack-free, multiply-free). Reads N at 0x100, txs at 0x104.., balances at
+// 0x2000+4a, keys at 0x3000+4a; applies tx iff mac(key[s],s,r,amt)==sig &&
+// bal[s]>=amt. This is the rollup's single deployed program.
+const TXPROC: &[u32] = &[
+    0x10002503, 0x0a050663, 0x11000593, 0x00003637, 0x000026b7, 0x0100006f, 0xfff50513, 0x01058593,
+    0x08050863, 0xff45a883, 0xff85a783, 0xffc5a703, 0x0005a283, 0x00289813, 0x0198d313, 0x00c803b3,
+    0x0003a383, 0x00789893, 0x0068e8b3, 0x00f75313, 0x0113c8b3, 0x00f888b3, 0x0138d393, 0x00d89893,
+    0x0078e8b3, 0x01171393, 0x0063e333, 0x0068c8b3, 0x00589313, 0x011308b3, 0x00b8d313, 0x011348b3,
+    0xf8589ce3, 0x00d80833, 0x00082883, 0xf8e8e6e3, 0x40e888b3, 0x00279793, 0x01182023, 0x00d787b3,
+    0x0007a803, 0x00e80733, 0x00e7a023, 0xf6dff06f, 0x0000006f,
+];
+
+// Demo rollup config: number of accounts in the balance state.
+const TX_ACCOUNTS: u32 = 8;
+
+fn key_of(acct: u32) -> u32 {
+    0xABCD0000u32 ^ acct
+}
+
+// Multiply-free keyed MAC (must match programs/txproc mac()).
+fn mac(key: u32, s: u32, r: u32, amt: u32) -> u32 {
+    let mut h = key ^ s.rotate_left(7);
+    h = h.wrapping_add(r).rotate_left(13);
+    h ^= amt.rotate_left(17);
+    h = h.wrapping_add(h << 5);
+    h ^= h >> 11;
+    h
+}
+
+/// Genesis balance state: balance[a]=1e6, key[a]=key_of(a), for a in 0..ACCOUNTS.
+fn genesis_state() -> Vec<(u32, u32)> {
+    let mut mem = Vec::new();
+    for a in 0..TX_ACCOUNTS {
+        mem.push((0x2000 + 4 * a, 1_000_000));
     }
-    unsafe { core::ptr::write_volatile(0x200 as *mut u32, acc) };
-    loop {}
+    for a in 0..TX_ACCOUNTS {
+        mem.push((0x3000 + 4 * a, key_of(a)));
+    }
+    mem
 }
-"#;
 
-const SRC_ADD: &str = r#"#![no_std]
-#![no_main]
-
-// add : mem[0x100] + mem[0x104] -> mem[0x200].
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
-    let a = unsafe { core::ptr::read_volatile(0x100 as *const u32) };
-    let b = unsafe { core::ptr::read_volatile(0x104 as *const u32) };
-    unsafe { core::ptr::write_volatile(0x200 as *mut u32, a.wrapping_add(b)) };
-    loop {}
-}
-"#;
-
-const SRC_INC: &str = r#"#![no_std]
-#![no_main]
-
-// increment : a persistent counter at mem[0x200] (carried block to block).
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
-    let c = unsafe { core::ptr::read_volatile(0x200 as *const u32) };
-    unsafe { core::ptr::write_volatile(0x200 as *mut u32, c.wrapping_add(1)) };
-    loop {}
-}
-"#;
-
-/// The sample programs as (name, compiled rv32im words, input bytes, declared
-/// memory slots, Rust source). The words are real rustc output for the source
-/// shown (stack-free; input at 0x100/0x104, output at 0x200).
-fn samples() -> Vec<(&'static str, Vec<u32>, Vec<u8>, Vec<(u32, u32)>, &'static str)> {
-    let sum = vec![
-        0x10002583, 0x00058e63, 0x00000513, 0x00100613, 0x00c50533, 0x00160613,
-        0xfec5fce3, 0x0080006f, 0x00000513, 0x20a02023, 0x0000006f,
-    ];
-    let addst = vec![0x10002503, 0x10402583, 0x00a58533, 0x20a02023, 0x0000006f];
-    let inc = vec![0x20002503, 0x00150513, 0x20a02023, 0x0000006f];
-    vec![
-        ("sum_1_to_n", sum, 3u32.to_le_bytes().to_vec(), vec![(0x200, 0)], SRC_SUM),
-        ("add", addst, {
-            let mut v = 7u32.to_le_bytes().to_vec();
-            v.extend_from_slice(&35u32.to_le_bytes());
-            v
-        }, vec![(0x200, 0)], SRC_ADD),
-        ("increment", inc, vec![], vec![(0x200, 0)], SRC_INC),
-    ]
+/// A block of `n` valid signed transfers (1 unit each, round-robin), encoded as
+/// input bytes: [N, (sender,recipient,amount,sig) * N].
+fn tx_batch(n: u32) -> Vec<u8> {
+    let mut input = Vec::new();
+    input.extend_from_slice(&n.to_le_bytes());
+    for i in 0..n {
+        let s = i % TX_ACCOUNTS;
+        let r = (i + 1) % TX_ACCOUNTS;
+        let amt = 1u32;
+        let sig = mac(key_of(s), s, r, amt);
+        for v in [s, r, amt, sig] {
+            input.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    input
 }
 
 fn main() {
-    // `rv32-rollup emit-sample` prints ready-to-submit JSON for the sample programs.
-    if std::env::args().any(|a| a == "emit-sample") {
-        for (name, prog, input, mem, source) in samples() {
-            let memj: Vec<Value> = mem.iter().map(|(a, v)| json!([a, v])).collect();
-            let sub = json!({"name":name,"program":hexs(&words_le(&prog)),"input":hexs(&input),"mem":memj,"source":source});
-            println!("{sub}");
-        }
+    // The rollup deploys ONE program: the transaction contract. Block 1 seeds the
+    // genesis balance state; subsequent blocks apply signed-transfer batches over
+    // the persistent state. `emit-sample <genesis|txbatch [N]>` prints the JSON.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "emit-sample") {
+        let mode = args.iter().skip_while(|a| *a != "emit-sample").nth(1).map(String::as_str).unwrap_or("txbatch");
+        let (name, input, mem): (&str, Vec<u8>, Vec<(u32, u32)>) = if mode == "genesis" {
+            ("genesis", 0u32.to_le_bytes().to_vec(), genesis_state())
+        } else {
+            let n: u32 = args.iter().skip_while(|a| *a != "emit-sample").nth(2).and_then(|s| s.parse().ok()).unwrap_or(4);
+            ("transactions", tx_batch(n), vec![])
+        };
+        let memj: Vec<Value> = mem.iter().map(|(a, v)| json!([a, v])).collect();
+        let sub = json!({"name":name,"program":hexs(&words_le(TXPROC)),"input":hexs(&input),"mem":memj,"source":SRC_TXPROC});
+        println!("{sub}");
         return;
     }
     let addr = env_or("RV32_ADDR", "0.0.0.0:8545");
