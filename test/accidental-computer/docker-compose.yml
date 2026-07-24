@@ -182,6 +182,9 @@ services:
     environment:
       - RV32_ADDR=0.0.0.0:8545
       - RV32_BLOCK_SECS=60
+      # Interpreter unroll depth for the tx contract: ~38 cycles/tx, so 256 steps
+      # covers a batch of up to ~6 transfers. Drives the circuit size (prove time).
+      - RV32_STEPS=256
       # 10-byte (20-hex) Celestia namespace ID: 3 zero bytes + "rv32rup". The
       # fibre uploader tool requires a v0 namespace ID (NamespaceVersionZeroIDSize
       # = 10 bytes).
@@ -227,10 +230,7 @@ services:
         }
         echo "submitter: waiting for rollup RPC at $$RPC ..."
         until curl -s -o /dev/null "$$RPC"; do sleep 2; done
-        echo "submitter: deploying genesis balance state"
-        submit "$$(rv32-rollup emit-sample genesis)"
-        sleep 60
-        echo "submitter: submitting a transaction batch every 60s"
+        echo "submitter: submitting a signed-transfer batch (genesis-seeded) every 60s"
         while true; do
           submit "$$(rv32-rollup emit-sample txbatch 4)"
           sleep 60

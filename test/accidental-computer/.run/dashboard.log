@@ -1,11 +1,6 @@
 $ vite
 
-  VITE v5.4.21  ready in 94 ms
+  VITE v5.4.21  ready in 101 ms
 
   ➜  Local:   http://localhost:3000/
   ➜  Network: use --host to expose
-2:35:59 AM [vite] hmr update /src/components/BlockProofs.jsx
-2:36:25 AM [vite] hmr update /src/App.jsx
-2:36:30 AM [vite] hmr update /src/App.jsx
-2:36:36 AM [vite] hmr update /src/components/BlockProofs.jsx
-2:36:50 AM [vite] hmr update /src/App.jsx, /src/components/BlockProofs.jsx

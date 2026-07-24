@@ -757,7 +757,11 @@ fn main() {
             ("genesis", 0u32.to_le_bytes().to_vec(), genesis_state())
         } else {
             let n: u32 = args.iter().skip_while(|a| *a != "emit-sample").nth(2).and_then(|s| s.parse().ok()).unwrap_or(4);
-            ("transactions", tx_batch(n), vec![])
+            // Seed the genesis balance state in every batch block so the transfers
+            // apply over a funded state (self-contained demo). The declared `mem`
+            // overrides the carried state, so each block starts from genesis and
+            // proves genesis_root -> post-batch root.
+            ("transactions", tx_batch(n), genesis_state())
         };
         let memj: Vec<Value> = mem.iter().map(|(a, v)| json!([a, v])).collect();
         let sub = json!({"name":name,"program":hexs(&words_le(TXPROC)),"input":hexs(&input),"mem":memj,"source":SRC_TXPROC});
