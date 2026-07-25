@@ -103,8 +103,6 @@ extern "C" {
 #endif
 
 extern int rsema1d_commit(uint32_t k, uint32_t n, unsigned char* rows, size_t rowLen, size_t numRows, unsigned char* outCommitment, uint64_t* outHandle);
-extern int rsema1d_open_at(uint64_t handle, uint32_t rangeStart, uint32_t rangeLen, unsigned char* point, size_t pointLen, uint32_t sampleCount, unsigned char** outProof, size_t* outProofLen);
-extern int rsema1d_verify_at(uint32_t k, uint32_t n, unsigned char* commitment, unsigned char* proof, size_t proofLen, unsigned char* point, size_t pointLen, unsigned char* outValue);
 extern void rsema1d_free_handle(uint64_t handle);
 extern void rsema1d_free_buf(unsigned char* buf);
 extern uint64_t rsema1d_encode_call_count(void);

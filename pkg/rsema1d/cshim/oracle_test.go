@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/celestiaorg/celestia-app/v10/pkg/rsema1d"
-	"github.com/celestiaorg/celestia-app/v10/pkg/rsema1d/field"
 )
 
 // oracleRows builds the K=4,N=4,rowBytes=64 square used by cmd/testvectors
@@ -22,18 +21,9 @@ func oracleRows() [][]byte {
 	return rows
 }
 
-// oraclePoint is the fixed evaluation point (2 GF128 challenges, matching
-// log2(rangeLen=4)) that the Rust round-trip test reuses byte-for-byte.
-func oraclePoint() []field.GF128 {
-	return []field.GF128{
-		{1, 2, 3, 4, 5, 6, 7, 8},
-		{9, 10, 11, 12, 13, 14, 15, 16},
-	}
-}
-
-// TestOracleReference prints the pure-Go commitment and the opened/verified
-// evaluation value for the fixed vector. Run with -v; the Rust FFI round-trip
-// test asserts it reproduces these exact bytes.
+// TestOracleReference prints the pure-Go commitment for the fixed vector. Run
+// with -v; the Rust commitment-identity gate (rsema1d-sys/tests/identity.rs)
+// asserts the FFI reproduces these exact bytes.
 //
 //	go test -v -run TestOracleReference ./pkg/rsema1d/cshim
 func TestOracleReference(t *testing.T) {
@@ -48,20 +38,6 @@ func TestOracleReference(t *testing.T) {
 	}
 	commitment := ed.Commitment()
 	t.Logf("ORACLE_COMMITMENT=%s", hex.EncodeToString(commitment[:]))
-
-	r := rsema1d.RowRange{Start: 0, Len: 4}
-	const sampleCount = 8
-	proof, err := ed.OpenAtLegacy(r, oraclePoint(), sampleCount)
-	if err != nil {
-		t.Fatal(err)
-	}
-	value, err := rsema1d.VerifyAtLegacy(cfg, commitment, proof, oraclePoint())
-	if err != nil {
-		t.Fatalf("pure-Go verify failed: %v", err)
-	}
-	var vbuf [field.GF128Size]byte
-	field.EncodeGF128(vbuf[:], value)
-	t.Logf("ORACLE_VALUE=%s", hex.EncodeToString(vbuf[:]))
 }
 
 // TestOracleReference2 is a second K/N/rowBytes case (matching cmd/testvectors

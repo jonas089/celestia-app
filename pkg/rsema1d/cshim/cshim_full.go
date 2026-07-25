@@ -19,7 +19,7 @@ import (
 )
 
 // This file is the additive C-ABI surface for the FULL-POINT opening of the
-// ORIGINAL Encode commitment (OpenAtFullLegacy / VerifyAtFullLegacy, see
+// ORIGINAL Encode commitment (OpenAtFull / VerifyAtFull, see
 // pkg/rsema1d/pcs_full_legacy.go).
 // It mirrors cshim.go exactly, but the point is supplied as TWO little-endian
 // GF128 blobs — the column point rCol and the row point rRow — because an
@@ -57,7 +57,7 @@ func rsema1d_open_at_full(handle C.uint64_t, rangeStart, rangeLen C.uint32_t, rc
 	}
 
 	r := rsema1d.RowRange{Start: int(rangeStart), Len: int(rangeLen)}
-	proof, err := ed.OpenAtFullLegacy(r, rCol, rRow, int(sampleCount))
+	proof, err := ed.OpenAtFull(r, rCol, rRow, int(sampleCount))
 	if err != nil {
 		return 3
 	}
@@ -106,7 +106,7 @@ func rsema1d_verify_at_full(k, n C.uint32_t, commitment *C.uchar, proof *C.uchar
 	}
 
 	cfg := &rsema1d.Config{K: int(k), N: int(n), WorkerCount: 1}
-	val, err := rsema1d.VerifyAtFullLegacy(cfg, commit, ep, rCol, rRow)
+	val, err := rsema1d.VerifyAtFull(cfg, commit, ep, rCol, rRow)
 	if err != nil {
 		return 4
 	}

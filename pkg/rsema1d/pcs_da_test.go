@@ -7,11 +7,11 @@ import (
 	"github.com/celestiaorg/celestia-app/v10/pkg/rsema1d/rlc"
 )
 
-// TestLegacyFullPointRoundTrip opens the ORIGINAL Encode commitment at a full
+// TestFullPointRoundTrip opens the ORIGINAL Encode commitment at a full
 // point and cross-checks the verified value against the independent MLE
-// reference (evalMatrixFull, defined in pcs_full_test.go). This proves the
+// reference (evalMatrixFull, defined in pcs_test.go). This proves the
 // encode-once opening returns the genuine multilinear evaluation.
-func TestLegacyFullPointRoundTrip(t *testing.T) {
+func TestFullPointRoundTrip(t *testing.T) {
 	cfg := &Config{K: 8, N: 8, WorkerCount: 2}
 	const rowBytes = 128 // numSymbols = 64 = 2^6 columns
 	const numSymbols = rowBytes / 2
@@ -37,11 +37,11 @@ func TestLegacyFullPointRoundTrip(t *testing.T) {
 		}
 		rRow := randChallenges("LEGACY-FULL-ROW", logRows)
 
-		proof, err := ed.OpenAtFullLegacy(r, rCol, rRow, cfg.K+cfg.N)
+		proof, err := ed.OpenAtFull(r, rCol, rRow, cfg.K+cfg.N)
 		if err != nil {
 			t.Fatalf("range %+v: open failed: %v", r, err)
 		}
-		val, err := VerifyAtFullLegacy(cfg, commit, proof, rCol, rRow)
+		val, err := VerifyAtFull(cfg, commit, proof, rCol, rRow)
 		if err != nil {
 			t.Fatalf("range %+v: verify failed: %v", r, err)
 		}
@@ -61,9 +61,9 @@ func TestLegacyFullPointRoundTrip(t *testing.T) {
 	}
 }
 
-// TestLegacyFullPointRejectsTampering is gate (C) at the Go layer for the
+// TestFullPointRejectsTampering is gate (C) at the Go layer for the
 // encode-once opening.
-func TestLegacyFullPointRejectsTampering(t *testing.T) {
+func TestFullPointRejectsTampering(t *testing.T) {
 	cfg := &Config{K: 8, N: 8, WorkerCount: 2}
 	const rowBytes = 128
 	logCols := 6
@@ -80,18 +80,18 @@ func TestLegacyFullPointRejectsTampering(t *testing.T) {
 	rCol := randChallenges("LTAMP-COL", logCols)
 	rRow := randChallenges("LTAMP-ROW", logRows)
 
-	base, _ := ed.OpenAtFullLegacy(r, rCol, rRow, cfg.K+cfg.N)
-	if _, err := VerifyAtFullLegacy(cfg, commit, base, rCol, rRow); err != nil {
+	base, _ := ed.OpenAtFull(r, rCol, rRow, cfg.K+cfg.N)
+	if _, err := VerifyAtFull(cfg, commit, base, rCol, rRow); err != nil {
 		t.Fatalf("honest proof must verify: %v", err)
 	}
 
 	mustReject := func(name string, mutate func(p *EvalProofFull), vCol, vRow []field.GF128) {
-		p, err := ed.OpenAtFullLegacy(r, rCol, rRow, cfg.K+cfg.N)
+		p, err := ed.OpenAtFull(r, rCol, rRow, cfg.K+cfg.N)
 		if err != nil {
 			t.Fatalf("%s: open failed: %v", name, err)
 		}
 		mutate(p)
-		if _, err := VerifyAtFullLegacy(cfg, commit, p, vCol, vRow); err == nil {
+		if _, err := VerifyAtFull(cfg, commit, p, vCol, vRow); err == nil {
 			t.Fatalf("%s: expected rejection but verify accepted", name)
 		}
 	}
@@ -140,11 +140,11 @@ func TestEncodeOnceCommitmentSharedWithDASampler(t *testing.T) {
 	r := RowRange{Start: 0, Len: 8}
 	rCol := randChallenges("DA-COL", logCols)
 	rRow := randChallenges("DA-ROW", 3)
-	proof, err := ed.OpenAtFullLegacy(r, rCol, rRow, cfg.K+cfg.N)
+	proof, err := ed.OpenAtFull(r, rCol, rRow, cfg.K+cfg.N)
 	if err != nil {
 		t.Fatalf("GKR open failed: %v", err)
 	}
-	if _, err := VerifyAtFullLegacy(cfg, commit, proof, rCol, rRow); err != nil {
+	if _, err := VerifyAtFull(cfg, commit, proof, rCol, rRow); err != nil {
 		t.Fatalf("GKR verify failed: %v", err)
 	}
 

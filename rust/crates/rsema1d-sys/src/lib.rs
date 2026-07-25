@@ -32,28 +32,6 @@ extern "C" {
         out_handle: *mut u64,
     ) -> c_int;
 
-    fn rsema1d_open_at(
-        handle: u64,
-        range_start: u32,
-        range_len: u32,
-        point: *const u8,
-        point_len: usize,
-        sample_count: u32,
-        out_proof: *mut *mut u8,
-        out_proof_len: *mut usize,
-    ) -> c_int;
-
-    fn rsema1d_verify_at(
-        k: u32,
-        n: u32,
-        commitment: *const u8,
-        proof: *const u8,
-        proof_len: usize,
-        point: *const u8,
-        point_len: usize,
-        out_value: *mut u8,
-    ) -> c_int;
-
     fn rsema1d_open_at_full(
         handle: u64,
         range_start: u32,
@@ -272,47 +250,6 @@ pub fn commit(k: u32, n: u32, rows: &[&[u8]]) -> Result<([u8; COMMITMENT_SIZE], 
     Ok((commitment, Handle(handle)))
 }
 
-/// Opens the subset evaluation for `range` at `point`, sampling `sample_count`
-/// rows for the proximity check, and returns the serialized `EvalProof` bytes.
-///
-/// `point` is the little-endian concatenation of `log2(range.len)` GF128
-/// elements (`16 * log2(range.len)` bytes).
-///
-/// Note: `sample_count` is an explicit parameter here (the Go prover needs it);
-/// callers typically pass a small fixed count such as 8.
-pub fn open_at(
-    handle: &Handle,
-    range: RowRange,
-    point: &[u8],
-    sample_count: u32,
-) -> Result<Vec<u8>, FfiError> {
-    let mut out_proof: *mut u8 = std::ptr::null_mut();
-    let mut out_len: usize = 0;
-    // SAFETY: handle.0 is a live registry key; point is a valid slice; the shim
-    // writes a malloc'd buffer into out_proof / out_len.
-    let rc = unsafe {
-        rsema1d_open_at(
-            handle.0,
-            range.start,
-            range.len,
-            point.as_ptr(),
-            point.len(),
-            sample_count,
-            &mut out_proof as *mut *mut u8,
-            &mut out_len as *mut usize,
-        )
-    };
-    if rc != 0 {
-        return Err(FfiError { func: "rsema1d_open_at", code: rc });
-    }
-
-    // Copy the Go-owned buffer into a Rust Vec, then free it immediately.
-    // SAFETY: out_proof points to out_len bytes malloc'd by the shim.
-    let proof = unsafe { std::slice::from_raw_parts(out_proof, out_len).to_vec() };
-    unsafe { rsema1d_free_buf(out_proof) };
-    Ok(proof)
-}
-
 /// Opens the subset evaluation for `range` at the FULL point (`rcol`, `rrow`),
 /// spanning both the column and row variables of the committed square, sampling
 /// `sample_count` rows for the proximity check, and returns the serialized
@@ -393,34 +330,3 @@ pub fn verify_at_full(
     }
 }
 
-/// Verifies a serialized `EvalProof` against `commitment` at `point`. Returns
-/// `Some(value)` (the 16-byte GF128 evaluation) when verification succeeds, or
-/// `None` when the Go verifier rejects the proof.
-pub fn verify_at(
-    k: u32,
-    n: u32,
-    commitment: &[u8; COMMITMENT_SIZE],
-    proof: &[u8],
-    point: &[u8],
-) -> Option<[u8; GF128_SIZE]> {
-    let mut value = [0u8; GF128_SIZE];
-    // SAFETY: all pointers reference live Rust buffers with the given lengths;
-    // the shim copies out of them and writes value in place.
-    let rc = unsafe {
-        rsema1d_verify_at(
-            k,
-            n,
-            commitment.as_ptr(),
-            proof.as_ptr(),
-            proof.len(),
-            point.as_ptr(),
-            point.len(),
-            value.as_mut_ptr(),
-        )
-    };
-    if rc == 0 {
-        Some(value)
-    } else {
-        None
-    }
-}

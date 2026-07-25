@@ -346,7 +346,7 @@ stop:
 ui-up:
 	@mkdir -p $(ACCIDENTAL_RUNDIR)
 	@echo "--> Starting dashboard API on http://localhost:8088 (ACCPROOF_RPC=$(ACCPROOF_RPC))"
-	@ACCPROOF_RPC=$(ACCPROOF_RPC) RETH_RPC=$(ACCPROOF_RPC) ROLLUP_NS=$(ROLLUP_NS) nohup go run ./test/accidental-computer/api > $(ACCIDENTAL_RUNDIR)/api.log 2>&1 & echo $$! > $(ACCIDENTAL_RUNDIR)/api.pid
+	@ACCPROOF_RPC=$(ACCPROOF_RPC) ROLLUP_NS=$(ROLLUP_NS) nohup go run ./test/accidental-computer/api > $(ACCIDENTAL_RUNDIR)/api.log 2>&1 & echo $$! > $(ACCIDENTAL_RUNDIR)/api.pid
 	@echo "--> Starting dashboard UI on http://localhost:3000"
 	@cd test/accidental-computer/dashboard && (pnpm install >/dev/null 2>&1 || true); nohup pnpm dev > $(ACCIDENTAL_RUNDIR)/dashboard.log 2>&1 & echo $$! > $(ACCIDENTAL_RUNDIR)/dashboard.pid
 	@sleep 1

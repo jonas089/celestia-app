@@ -10,11 +10,11 @@
 //
 // This emits librsema1d.dylib and a matching librsema1d.h header.
 //
-// The API is handle-based: rsema1d_commit stores the StructuredCommitment in a
+// The API is handle-based: rsema1d_commit stores the ExtendedData in a
 // mutex-guarded Go registry keyed by a monotonic uint64 handle and returns the
-// 32-byte commitment. rsema1d_open_at looks the handle up and serializes an
-// EvalProof into a C.malloc'd buffer the caller must release with
-// rsema1d_free_buf. rsema1d_verify_at is stateless.
+// 32-byte commitment. rsema1d_open_at_full (cshim_full.go) looks the handle up
+// and serializes an EvalProofFull into a C.malloc'd buffer the caller must
+// release with rsema1d_free_buf. rsema1d_verify_at_full is stateless.
 //
 // cgo pointer rules: no Go pointer is ever handed to or retained by the caller.
 // Every input is copied into Go memory on entry (C.GoBytes / unsafe.Slice read)
@@ -29,7 +29,6 @@ package main
 import "C"
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"sync"
@@ -37,8 +36,6 @@ import (
 
 	"github.com/celestiaorg/celestia-app/v10/pkg/rsema1d"
 	"github.com/celestiaorg/celestia-app/v10/pkg/rsema1d/field"
-	"github.com/celestiaorg/celestia-app/v10/pkg/rsema1d/merkle"
-	"github.com/celestiaorg/celestia-app/v10/pkg/rsema1d/rlc"
 )
 
 // registry maps opaque uint64 handles to the live ExtendedData objects held on
@@ -49,7 +46,7 @@ import (
 // (starts at 1 so 0 is never a valid handle).
 var (
 	mu         sync.Mutex
-	registry   = make(map[uint64]*rsema1d.ExtendedData)
+	registry          = make(map[uint64]*rsema1d.ExtendedData)
 	nextHandle uint64 = 1
 )
 
@@ -60,7 +57,7 @@ func main() {}
 const commitmentSize = 32
 
 // rsema1d_commit encodes a K+N row matrix with the ORIGINAL Coder.Encode (the
-// canonical DA/spec commitment: rows RS-encoded -> rowRoot; legacy
+// canonical DA/spec commitment: rows RS-encoded -> rowRoot; spec
 // DeriveCoefficients RLC -> rlcRoot; SHA256(rowRoot||rlcRoot)), stores the
 // resulting ExtendedData in the handle registry, and writes the 32-byte
 // commitment. This is byte-identical to cmd/testvectors and to DA sampling.
@@ -118,88 +115,7 @@ func rsema1d_commit(k, n C.uint32_t, rows *C.uchar, rowLen, numRows C.size_t, ou
 	return 0
 }
 
-// rsema1d_open_at opens the subset evaluation for the row range [rangeStart,
-// rangeStart+rangeLen) at the externally supplied point, sampling sampleCount
-// rows for the proximity check, and serializes the EvalProof into a freshly
-// C.malloc'd buffer (*outProof, *outProofLen). The caller owns that buffer and
-// must free it with rsema1d_free_buf.
-//
-// point is pointLen bytes = 16 * log2(rangeLen) little-endian GF128 elements.
-//
-// Return codes: 0 ok; 1 unknown handle; 2 pointLen not a multiple of 16;
-// 3 OpenAtLegacy failed; 4 allocation failed.
-//
-//export rsema1d_open_at
-func rsema1d_open_at(handle C.uint64_t, rangeStart, rangeLen C.uint32_t, point *C.uchar, pointLen C.size_t, sampleCount C.uint32_t, outProof **C.uchar, outProofLen *C.size_t) C.int {
-	mu.Lock()
-	ed := registry[uint64(handle)]
-	mu.Unlock()
-	if ed == nil {
-		return 1
-	}
-
-	rRow, ok := decodePoint(point, int(pointLen))
-	if !ok {
-		return 2
-	}
-
-	r := rsema1d.RowRange{Start: int(rangeStart), Len: int(rangeLen)}
-	proof, err := ed.OpenAtLegacy(r, rRow, int(sampleCount))
-	if err != nil {
-		return 3
-	}
-
-	blob := serializeProof(proof)
-	cbuf := C.malloc(C.size_t(len(blob)))
-	if cbuf == nil {
-		return 4
-	}
-	dst := unsafe.Slice((*byte)(cbuf), len(blob))
-	copy(dst, blob)
-	*outProof = (*C.uchar)(cbuf)
-	*outProofLen = C.size_t(len(blob))
-	return 0
-}
-
-// rsema1d_verify_at deserializes an EvalProof and verifies it against the
-// 32-byte commitment at the supplied point, writing the verified 16-byte GF128
-// value into outValue. rc 0 means verified.
-//
-// Return codes: 0 verified; 1 nil pointer arg; 2 proof deserialization failed;
-// 3 pointLen not a multiple of 16; 4 VerifyAtLegacy rejected the proof.
-//
-//export rsema1d_verify_at
-func rsema1d_verify_at(k, n C.uint32_t, commitment *C.uchar, proof *C.uchar, proofLen C.size_t, point *C.uchar, pointLen C.size_t, outValue *C.uchar) C.int {
-	if commitment == nil || proof == nil || outValue == nil {
-		return 1
-	}
-
-	var commit rsema1d.Commitment
-	copy(commit[:], C.GoBytes(unsafe.Pointer(commitment), commitmentSize))
-
-	blob := C.GoBytes(unsafe.Pointer(proof), C.int(proofLen))
-	ep, err := deserializeProof(blob)
-	if err != nil {
-		return 2
-	}
-
-	rRow, ok := decodePoint(point, int(pointLen))
-	if !ok {
-		return 3
-	}
-
-	cfg := &rsema1d.Config{K: int(k), N: int(n), WorkerCount: 1}
-	val, err := rsema1d.VerifyAtLegacy(cfg, commit, ep, rRow)
-	if err != nil {
-		return 4
-	}
-
-	out := unsafe.Slice((*byte)(unsafe.Pointer(outValue)), field.GF128Size)
-	field.EncodeGF128(out, val)
-	return 0
-}
-
-// rsema1d_free_handle drops the StructuredCommitment for handle from the
+// rsema1d_free_handle drops the ExtendedData for handle from the
 // registry, releasing it to the Go GC. No-op for unknown handles.
 //
 //export rsema1d_free_handle
@@ -209,7 +125,7 @@ func rsema1d_free_handle(handle C.uint64_t) {
 	mu.Unlock()
 }
 
-// rsema1d_free_buf frees a buffer previously returned by rsema1d_open_at.
+// rsema1d_free_buf frees a buffer previously returned by rsema1d_open_at_full.
 //
 //export rsema1d_free_buf
 func rsema1d_free_buf(buf *C.uchar) {
@@ -236,126 +152,6 @@ func decodePoint(point *C.uchar, pointLen int) ([]field.GF128, bool) {
 		rRow[i] = field.DecodeGF128(pb[i*field.GF128Size:])
 	}
 	return rRow, true
-}
-
-// --- EvalProof binary format (all integers little-endian) ---
-//
-//	Range.Start        u32
-//	Range.Len          u32
-//	Value              16 bytes (GF128, little-endian)
-//	len(Yr)            u32
-//	Yr[i]              16 bytes each
-//	len(SampledRows)   u32
-//	per sampled row:
-//	  Index            u32
-//	  RowLen           u32
-//	  Row              RowLen bytes
-//	  ProofDepth       u32
-//	  node[j]          32 bytes each (merkle.NodeSize)
-
-func serializeProof(p *rsema1d.EvalProof) []byte {
-	var b bytes.Buffer
-	var scratch [4]byte
-	putU32 := func(v uint32) {
-		binary.LittleEndian.PutUint32(scratch[:], v)
-		b.Write(scratch[:])
-	}
-	var vbuf [field.GF128Size]byte
-	putGF := func(g field.GF128) {
-		field.EncodeGF128(vbuf[:], g)
-		b.Write(vbuf[:])
-	}
-
-	putU32(uint32(p.Range.Start))
-	putU32(uint32(p.Range.Len))
-	putGF(p.Value)
-
-	putU32(uint32(len(p.Yr)))
-	for _, y := range p.Yr {
-		putGF(y)
-	}
-
-	putU32(uint32(len(p.SampledRows)))
-	for _, sr := range p.SampledRows {
-		putU32(uint32(sr.Index))
-		putU32(uint32(len(sr.Row)))
-		b.Write(sr.Row)
-		putU32(uint32(len(sr.RowProof)))
-		for _, node := range sr.RowProof {
-			b.Write(node) // merkle.NodeSize bytes each
-		}
-	}
-	return b.Bytes()
-}
-
-func deserializeProof(blob []byte) (*rsema1d.EvalProof, error) {
-	r := &reader{buf: blob}
-
-	start, err := r.u32()
-	if err != nil {
-		return nil, err
-	}
-	length, err := r.u32()
-	if err != nil {
-		return nil, err
-	}
-	value, err := r.gf128()
-	if err != nil {
-		return nil, err
-	}
-
-	yrLen, err := r.u32()
-	if err != nil {
-		return nil, err
-	}
-	yr := make(rlc.Vector, yrLen)
-	for i := range yr {
-		if yr[i], err = r.gf128(); err != nil {
-			return nil, err
-		}
-	}
-
-	nRows, err := r.u32()
-	if err != nil {
-		return nil, err
-	}
-	sampled := make([]*rsema1d.RowProof, nRows)
-	for i := range sampled {
-		idx, err := r.u32()
-		if err != nil {
-			return nil, err
-		}
-		rowLen, err := r.u32()
-		if err != nil {
-			return nil, err
-		}
-		row, err := r.bytes(int(rowLen))
-		if err != nil {
-			return nil, err
-		}
-		depth, err := r.u32()
-		if err != nil {
-			return nil, err
-		}
-		path := make([][]byte, depth)
-		for j := range path {
-			if path[j], err = r.bytes(merkle.NodeSize); err != nil {
-				return nil, err
-			}
-		}
-		sampled[i] = &rsema1d.RowProof{Index: int(idx), Row: row, RowProof: path}
-	}
-
-	if r.off != len(r.buf) {
-		return nil, fmt.Errorf("trailing %d bytes in proof blob", len(r.buf)-r.off)
-	}
-
-	return &rsema1d.EvalProof{
-		Range:       rsema1d.RowRange{Start: int(start), Len: int(length)},
-		Yr:          yr,
-		SampledRows: sampled,
-		Value:       value,
-	}, nil
 }
 
 // reader is a bounds-checked cursor over the proof blob.
