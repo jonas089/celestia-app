@@ -1,386 +1,218 @@
 import { useMemo, useState } from 'react'
 import { CopyButton } from './CopyButton.jsx'
-import {
-  truncHex, fmtBytes, fmtDuration, timeAgo,
-  hexToWordsLE, disasm, opClasses,
-} from '../util.js'
+import { fmtBytes, fmtDuration, timeAgo, hexToWordsLE, disasm, opClasses } from '../util.js'
 
-// Live, newest-first per-block proof feed for the rv32i accidental computer.
-// Each block executes committed rv32i over persistent VM state and is GKR-proven
-// by reusing the on-DA rsema1d commitment. Cards animate in on arrival and
-// expand into tabbed, scrollable detail (disassembly, I/O, proof, verify).
-export function RollupFeed({ blocks, rollupNS, scope, backendError }) {
-  const labelOf = useMemo(() => {
-    const m = new Map()
-    for (const b of blocks) {
-      if (b.program) m.set(b.program, b.programName || 'program')
-    }
-    return (hex) => m.get(hex) || 'program'
-  }, [blocks])
-
+// Live, newest-first per-block feed. Each row is a clean summary; click to expand
+// full detail (all hashes shown in full, plus source / disassembly / I/O / verify).
+export function RollupFeed({ blocks, now, rollupNS, scope, backendError }) {
   return (
     <section className="feed">
       <div className="feed__head">
-        <h2>Block proofs</h2>
+        <h2>Blocks</h2>
         <span className="muted">newest first · live</span>
       </div>
 
       <details className="scope">
-        <summary>Honest scope of the proof</summary>
-        <p>{scope || 'Each block executes committed rv32i over persistent VM state; program + input + pre-state posted to Celestia DA; GKR-proven by reusing the rsema1d/DA commitment as the sole PCS (zero prover re-encode).'}</p>
+        <summary>What is proved</summary>
+        <p>{scope || 'Each block executes committed rv32i over persistent VM state; program, input and pre-state are posted to Celestia DA; the block is GKR-proven by reusing the on-DA rsema1d commitment as the sole polynomial commitment (the prover re-encodes nothing) and binds pre_root → post_root in-circuit.'}</p>
       </details>
 
       {backendError && (
-        <p className="inline-error">
-          rollup backend: {String(backendError)}. Start the rv32-rollup and submit blocks
-          (namespace <code className="mono">{rollupNS}</code>).
-        </p>
+        <p className="inline-error">rollup backend: {String(backendError)} (namespace <code className="mono">{rollupNS}</code>)</p>
       )}
 
       {blocks.length === 0 && !backendError && (
-        <div className="empty">
-          <div className="spinner" aria-hidden />
-          <p className="muted">Waiting for the first block. The submitter injects a program every ~60s.</p>
-        </div>
+        <div className="empty"><span className="spinner" aria-hidden /><span className="muted">Waiting for the first block…</span></div>
       )}
 
-      <div className="cards">
-        {blocks.map((b) => (
-          <BlockCard key={b.blockNumber} b={b} label={labelOf(b.program)} />
-        ))}
+      <div className="blocks">
+        {blocks.map((b) => <BlockCard key={b.blockNumber} b={b} now={now} />)}
       </div>
     </section>
   )
 }
 
-function statusInfo(b) {
-  switch (b.status) {
-    case 'proved': return b.verified
-      ? { kind: 'ok', label: 'proved', icon: '✓' }
-      : { kind: 'bad', label: 'unverified', icon: '✕' }
-    case 'failed': return { kind: 'bad', label: 'failed', icon: '✕' }
-    case 'proving': return { kind: 'proving', label: 'proving' }
-    case 'queued': return { kind: 'queued', label: 'queued' }
-    default: return { kind: 'queued', label: b.status || 'pending' }
-  }
+function kindOf(b) {
+  if (b.status === 'proved') return b.verified ? 'ok' : 'warn'
+  if (b.status === 'failed') return 'bad'
+  if (b.status === 'proving') return 'proving'
+  return 'queued'
+}
+function statusWord(b) {
+  if (b.status === 'proved') return b.verified ? 'verified' : 'unverified'
+  return b.status || 'pending'
 }
 
-const TABS = ['Overview', 'Source', 'Program', 'I/O', 'Proof', 'Verify']
+const TABS = ['Overview', 'Source', 'Program', 'I/O']
 
-function BlockCard({ b, label }) {
-  const [tab, setTab] = useState(null) // null = collapsed
-  const st = statusInfo(b)
+function BlockCard({ b, now }) {
+  const [open, setOpen] = useState(false)
+  const [tab, setTab] = useState('Overview')
+  const kind = kindOf(b)
   const words = useMemo(() => hexToWordsLE(b.program), [b.program])
+  const provingSecs = b.status === 'proving' && b.submittedUnix
+    ? Math.max(0, Math.floor(now / 1000) - b.submittedUnix) : null
 
   return (
-    <article className={`bcard bcard--${st.kind}`}>
-      <div className="bcard__accent" />
-
-      <div className="bcard__head">
-        <div className="bcard__ids">
-          <span className="bcard__height">#{b.blockNumber} <small>· {(b.numTx || 0).toLocaleString()} tx</small></span>
-          <span className="bcard__sub mono">{(b.numTx || 0).toLocaleString()} tx · {(b.numCycles || 0).toLocaleString()} cycles · {words.length} instrs</span>
-        </div>
-        <StatusBadge st={st} />
-      </div>
-
-      <div className="chips">
-        <span className="chip chip--flag" title="Raw rv32i executed in-circuit; the on-DA rsema1d commitment is the sole (reused) GKR input commitment.">accidental computer · in-circuit rv32i</span>
-        <span className="chip chip--prog">{label}</span>
-        <span className="chip chip--tx" title={`${b.numTx || 0} transactions proven in one GKR proof across ${b.numLanes || 1} GF2x8 SIMD lane(s)`}>
-          {(b.numTx || 0).toLocaleString()} transactions{(b.numLanes || 1) > 1 ? ` · ${b.numLanes} lanes` : ''}
+    <article className={`blk blk--${kind} ${open ? 'blk--open' : ''}`}>
+      <button className="blk__bar" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+        <span className={`blk__dot blk__dot--${kind}`} />
+        <span className="blk__num">#{b.blockNumber}</span>
+        <span className="blk__facts">
+          <b>{(b.numTx || 0).toLocaleString()}</b> tx
+          <span className="dotsep">·</span>{(b.numCycles || 0).toLocaleString()} cycles
+          {(b.numLanes || 1) > 1 && <><span className="dotsep">·</span>{b.numLanes} lanes</>}
         </span>
-        <span className="chip chip--total">{(b.numCycles || 0).toLocaleString()} cycles</span>
-        <span className="chip mono" title={b.input || '0x'}>input {b.input && b.input !== '0x' ? truncHex(b.input, 6, 4) : '∅'}</span>
-        <span className="chip mono" title={b.output}>output {b.output && b.output !== '0x' ? truncHex(b.output, 6, 4) : '—'}</span>
-        {b.daHeight > 0 && <span className="chip">DA h{b.daHeight}</span>}
-      </div>
+        <span className="blk__spacer" />
+        <span className={`blk__stat blk__stat--${kind}`}>
+          {provingSecs != null ? `proving · ${provingSecs}s` : statusWord(b)}
+        </span>
+        <span className="blk__time">{timeAgo(b.provedUnix || b.submittedUnix)}</span>
+        <span className={`chev ${open ? 'chev--open' : ''}`} aria-hidden>›</span>
+      </button>
 
-      {st.kind !== 'bad' && (
-        <div className="metrics">
-          <Metric label="commitment (rsema1d == DA)">
-            {b.commitment
-              ? <span className="mono metric__hex" title={b.commitment}>{truncHex(b.commitment, 10, 6)}
-                  <span className="daflag daflag--ok">== DA</span><CopyButton value={b.commitment} label="⧉" /></span>
-              : <span className="muted">pending…</span>}
-          </Metric>
-          <Metric label="state root · pre → post">
-            {b.postRoot
-              ? <span className="mono metric__hex" title={`pre  ${b.preRoot}\npost ${b.postRoot}`}>
-                  {truncHex(b.preRoot, 6, 4)} → {truncHex(b.postRoot, 6, 4)}
-                  <CopyButton value={b.postRoot} label="⧉" />
-                </span>
-              : <span className="muted">pending…</span>}
-          </Metric>
-          <Metric label="GKR verified">
-            <span className={b.verified ? 'pill pill--ok' : 'pill pill--partial'}>
-              {b.verified ? '✓ verified' : b.status === 'proved' ? 'unverified' : b.status}
-            </span>
-          </Metric>
-          <Metric label="proof size · time">
-            <span className="mono">{b.proofBytes ? fmtBytes(b.proofBytes) : '—'}{b.elapsedMs ? ` · ${fmtDuration(b.elapsedMs)}` : ''}</span>
-          </Metric>
-        </div>
-      )}
+      {b.status === 'proving' && <span className="blk__progress" aria-hidden />}
 
-      {b.error && <ErrorLine msg={b.error} />}
-
-      <div className="bcard__actions">
-        {TABS.map((t) => (
-          <button key={t} className={`btn ${tab === t ? 'btn--active' : ''}`} onClick={() => setTab(tab === t ? null : t)}>{t}</button>
-        ))}
-        <span className="bcard__time">{timeAgo(b.provedUnix || b.submittedUnix)}</span>
-      </div>
-
-      {tab && (
-        <div className="drawer">
-          <div className="tabs">
+      {open && (
+        <div className="blk__body">
+          <nav className="tabs">
             {TABS.map((t) => (
               <button key={t} className={`tab ${tab === t ? 'tab--on' : ''}`} onClick={() => setTab(t)}>{t}</button>
             ))}
-          </div>
-          {tab === 'Overview' && <OverviewTab b={b} words={words} />}
-          {tab === 'Source' && <SourceTab b={b} />}
-          {tab === 'Program' && <ProgramTab b={b} words={words} />}
-          {tab === 'I/O' && <IoTab b={b} />}
-          {tab === 'Proof' && <ProofTab b={b} label={label} />}
-          {tab === 'Verify' && <VerifyTab b={b} />}
+          </nav>
+          {tab === 'Overview' && <Overview b={b} words={words} />}
+          {tab === 'Source' && <Source b={b} />}
+          {tab === 'Program' && <Program b={b} words={words} />}
+          {tab === 'I/O' && <Io b={b} />}
+          {b.error && <pre className="scrollbox err">{b.error}</pre>}
         </div>
       )}
     </article>
   )
 }
 
-function StatusBadge({ st }) {
-  return (
-    <span className={`sbadge sbadge--${st.kind}`}>
-      {st.kind === 'proving' && <span className="spinner spinner--sm" />}
-      {st.kind === 'queued' && <span className="sbadge__pulse" />}
-      {st.icon && <span className="sbadge__icon">{st.icon}</span>}
-      <span className="sbadge__label">{st.label}</span>
-    </span>
-  )
-}
+/* ------------------------------- tabs ------------------------------- */
 
-/* -------- tabs -------- */
-
-function OverviewTab({ b, words }) {
+function Overview({ b, words }) {
   const oc = useMemo(() => opClasses(words), [words])
   const total = Object.values(oc).reduce((a, c) => a + c, 0) || 1
-  const bars = [
-    ['alu', 'ALU'], ['mem', 'load/store'], ['branch', 'branch'],
-    ['jump', 'jump'], ['mul', 'mul/div'], ['other', 'other'],
-  ].filter(([k]) => oc[k] > 0)
-  return (
-    <div className="scrollbox">
-      <div className="kv">
-        <KV k="block height" v={`#${b.blockNumber}`} />
-        <KV k="status" v={b.status} />
-        <KV k="pre-state root" v={b.preRoot ? truncHex(b.preRoot, 12, 10) : '—'} full={b.preRoot} copy />
-        <KV k="post-state root" v={b.postRoot ? truncHex(b.postRoot, 12, 10) : '—'} full={b.postRoot} copy />
-        <KV k="transactions" v={`${(b.numTx || 0).toLocaleString()}${(b.numLanes || 1) > 1 ? ` · ${b.numLanes} SIMD lanes` : ''}`} />
-        <KV k="throughput" v={b.elapsedMs > 0 ? `${((b.numTx || 0) * 1000 / b.elapsedMs).toFixed(2)} tx/s` : '—'} />
-        <KV k="cycles executed" v={(b.numCycles || 0).toLocaleString()} />
-        <KV k="GKR input vars" v={b.inputVars} />
-        <KV k="DA settlement height" v={b.daHeight || '—'} />
-        <KV k="fibre tx" v={b.txHash ? truncHex(b.txHash, 10, 8) : '—'} full={b.txHash} copy />
-        <KV k="fibre blob id" v={b.blobId ? truncHex(b.blobId, 10, 8) : '—'} full={b.blobId} copy />
-        <KV k="submitted" v={b.submittedUnix ? timeAgo(b.submittedUnix) : '—'} />
-        <KV k="proved" v={b.provedUnix ? timeAgo(b.provedUnix) : '—'} />
-      </div>
-      <div style={{ marginTop: 12 }}>
-        <div className="metric__label">instruction mix ({words.length} instrs)</div>
-        <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
-          {bars.map(([k, name]) => (
-            <span key={k} className="chip">{name} · {Math.round((oc[k] / total) * 100)}%</span>
-          ))}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function SourceTab({ b }) {
-  return (
-    <div style={{ display: 'grid', gap: 12 }}>
-      <div>
-        <div className="srchead">
-          <span className="metric__label">Rust source · no_std, compiled to riscv32im</span>
-          {b.rustSource ? <CopyButton value={b.rustSource} label="⧉ copy" /> : null}
-        </div>
-        {b.rustSource
-          ? <pre className="scrollbox code">{b.rustSource}</pre>
-          : <div className="scrollbox"><span className="muted">No Rust source recorded for this program.</span></div>}
-      </div>
-      <div>
-        <div className="srchead">
-          <span className="metric__label">compiled rv32 bytecode · {b.program ? (b.program.replace(/^0x/, '').length / 8) | 0 : 0} words</span>
-          {b.program ? <CopyButton value={b.program} label="⧉ copy" /> : null}
-        </div>
-        <pre className="scrollbox hexdump">{b.program || '—'}</pre>
-      </div>
-    </div>
-  )
-}
-
-function ProgramTab({ b, words }) {
-  if (!words.length) return <div className="scrollbox"><span className="muted">No program words.</span></div>
-  return (
-    <>
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
-        <span className="metric__label">rv32im disassembly · {words.length} instructions</span>
-        <CopyButton value={b.program} label="⧉ copy hex" />
-      </div>
-      <div className="scrollbox asm">
-        {words.map((w, i) => {
-          const text = disasm(w)
-          const mnem = text.split(/\s/)[0]
-          const rest = text.slice(mnem.length)
-          return (
-            <div className="asm__row" key={i}>
-              <span className="asm__addr">{(i * 4).toString(16).padStart(4, '0')}:</span>
-              <span className="asm__word">{w.toString(16).padStart(8, '0')}</span>
-              <span className="asm__op"><b>{mnem}</b>{rest}</span>
-            </div>
-          )
-        })}
-      </div>
-    </>
-  )
-}
-
-function IoTab({ b }) {
-  return (
-    <div style={{ display: 'grid', gap: 10 }}>
-      <div>
-        <div className="metric__label" style={{ marginBottom: 6 }}>input (on DA)</div>
-        <div className="scrollbox hexdump">{hexdump(b.input) || '∅ (no input)'}</div>
-      </div>
-      <div>
-        <div className="metric__label" style={{ marginBottom: 6 }}>output — public value (on DA)</div>
-        <div className="scrollbox hexdump">{hexdump(b.output) || '— (no output)'}</div>
-      </div>
-    </div>
-  )
-}
-
-function ProofTab({ b, label }) {
-  function download() {
-    const info = {
-      program: label, blockHeight: b.blockNumber, status: b.status,
-      commitment_rsema1d_eq_DA: b.commitment, postStateRoot: b.stfStateRoot,
-      output: b.output, numCycles: b.numCycles, inputVars: b.inputVars,
-      proofBytes: b.proofBytes, elapsedMs: b.elapsedMs, verified: b.verified,
-      daHeight: b.daHeight, fibreTxHash: b.txHash, fibreBlobId: b.blobId,
-    }
-    const url = URL.createObjectURL(new Blob([JSON.stringify(info, null, 2)], { type: 'application/json' }))
-    const a = document.createElement('a')
-    a.href = url; a.download = `rv32-proof-h${b.blockNumber}.json`
-    document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url)
-  }
-  return (
-    <div className="scrollbox">
-      <div className="kv">
-        <KV k="commitment (reused DA)" v={b.commitment ? truncHex(b.commitment, 14, 10) : '—'} full={b.commitment} copy />
-        <KV k="post-state root" v={b.stfStateRoot ? truncHex(b.stfStateRoot, 14, 10) : '—'} full={b.stfStateRoot} copy />
-        <KV k="output" v={b.output ? truncHex(b.output, 14, 10) : '—'} full={b.output} copy />
-        <KV k="cycles" v={b.numCycles} />
-        <KV k="input vars (2^n square)" v={b.inputVars} />
-        <KV k="proof size" v={b.proofBytes ? fmtBytes(b.proofBytes) : '—'} />
-        <KV k="prove time" v={b.elapsedMs ? fmtDuration(b.elapsedMs) : '—'} />
-      </div>
-      <button className="btn btn--primary" style={{ marginTop: 12 }} onClick={download} disabled={!b.commitment}>⬇ Download proof info (JSON)</button>
-      <p className="muted" style={{ fontSize: 12, marginTop: 10 }}>
-        The raw proof is a {b.proofBytes ? fmtBytes(b.proofBytes) : 'large'} GKR transcript held by the
-        rollup. This exports the verified metadata. The GKR input commitment is the on-DA rsema1d
-        commitment, so the prover performed zero RS-encoding.
-      </p>
-    </div>
-  )
-}
-
-function VerifyTab({ b }) {
-  const proved = b.status === 'proved'
+  const mix = [['alu', 'ALU'], ['mem', 'load/store'], ['branch', 'branch'], ['jump', 'jump'], ['mul', 'mul/div'], ['other', 'other']]
+    .filter(([k]) => oc[k] > 0)
   const checks = [
-    { name: 'Expander GKR verifier ACCEPTED the rv32i execution', ok: proved && b.verified },
-    { name: 'GKR input commitment == reused rsema1d/DA encoding (32 bytes)', ok: (b.commitment || '').replace(/^0x/, '').length === 64 },
-    { name: 'block settled on Celestia DA (fibre MsgPayForFibre)', ok: (b.daHeight || 0) > 0 || !!b.txHash },
-    { name: 'public output present', ok: !!b.output && b.output !== '0x' },
-    { name: 'state transition bound in-circuit (pre_root → post_root)', ok: !!b.preRoot && !!b.postRoot },
+    ['Expander GKR verifier accepted the rv32i execution', b.status === 'proved' && b.verified],
+    ['GKR input commitment == reused rsema1d / DA encoding', (b.commitment || '').replace(/^0x/, '').length === 64],
+    ['settled on Celestia DA (fibre MsgPayForFibre)', (b.daHeight || 0) > 0 || !!b.txHash],
+    ['state transition bound in-circuit (pre_root → post_root)', !!b.preRoot && !!b.postRoot],
   ]
-  const verified = proved && b.verified
   return (
-    <div className={`verify ${verified ? 'verify--ok' : proved ? 'verify--warn' : 'verify--pending'}`}>
-      <div className="verify__badge">{proved ? (verified ? 'VERIFIED = TRUE' : 'NOT VERIFIED') : `status: ${b.status}`}</div>
+    <div className="ov">
+      <div className="grid">
+        <Fact k="transactions" v={`${(b.numTx || 0).toLocaleString()}${(b.numLanes || 1) > 1 ? `  ·  ${b.numLanes} SIMD lanes` : ''}`} />
+        <Fact k="throughput" v={b.elapsedMs > 0 ? `${((b.numTx || 0) * 1000 / b.elapsedMs).toFixed(2)} tx/s` : '—'} />
+        <Fact k="cycles executed" v={(b.numCycles || 0).toLocaleString()} />
+        <Fact k="prove time" v={b.elapsedMs ? fmtDuration(b.elapsedMs) : '—'} />
+        <Fact k="proof size" v={b.proofBytes ? fmtBytes(b.proofBytes) : '—'} />
+        <Fact k="GKR input vars" v={b.inputVars ? `2^${b.inputVars}` : '—'} />
+        <Fact k="DA settlement height" v={b.daHeight || '—'} />
+      </div>
+
+      <Hash k="commitment  (rsema1d == DA)" v={b.commitment} />
+      <Hash k="state root — before" v={b.preRoot} />
+      <Hash k="state root — after" v={b.postRoot} />
+      <Hash k="fibre blob id" v={b.blobId} />
+      <Hash k="fibre settlement tx" v={b.txHash} />
+
       <ul className="checks">
-        {checks.map((c, i) => (
-          <li key={i} className={c.ok ? 'check--ok' : 'check--bad'}>
-            <span className="check__mark">{c.ok ? '✓' : '✕'}</span><span>{c.name}</span>
-          </li>
+        {checks.map(([name, ok], i) => (
+          <li key={i} className={ok ? 'ok' : 'no'}><span>{ok ? '✓' : '·'}</span>{name}</li>
         ))}
       </ul>
+
+      {mix.length > 0 && (
+        <div className="mix">
+          {mix.map(([k, name]) => (
+            <div className="mix__row" key={k}>
+              <span className="mix__name">{name}</span>
+              <span className="mix__bar"><span style={{ width: `${(oc[k] / total) * 100}%` }} /></span>
+              <span className="mix__pct">{Math.round((oc[k] / total) * 100)}%</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
 
-/* -------- small pieces -------- */
-
-function Metric({ label, children }) {
-  return <div className="metric"><div className="metric__label">{label}</div><div className="metric__value">{children}</div></div>
-}
-
-// Extract a concise human reason from a verbose backend/prover error blob.
-function shortError(msg) {
-  if (!msg) return ''
-  const m = String(msg).replace(/\s+/g, ' ').trim()
-  const desc = m.match(/desc = ([^"]+?)(?:"|$)/)
-  if (desc) return desc[1].trim()
-  const tail = m.match(/(?:fibre upload|error):?\s*([^:]+:[^:]+)$/)
-  if (tail) return tail[1].trim()
-  return m.length > 160 ? m.slice(0, 160) + '…' : m
-}
-
-function ErrorLine({ msg }) {
-  const [open, setOpen] = useState(false)
+function Source({ b }) {
   return (
-    <div className="errbox">
-      <div className="errbox__line">
-        <span className="errbox__dot" />
-        <span className="errbox__reason" title={msg}>{shortError(msg)}</span>
-        <button className="errbox__toggle" onClick={() => setOpen((v) => !v)}>{open ? 'hide' : 'details'}</button>
-      </div>
-      {open && <pre className="scrollbox errbox__full">{msg}</pre>}
+    <div className="src">
+      <div className="src__head"><span>Rust source · no_std → riscv32im</span>{b.rustSource && <CopyButton value={b.rustSource} label="copy" />}</div>
+      <pre className="scrollbox code">{b.rustSource || 'No source recorded.'}</pre>
+      <div className="src__head"><span>compiled bytecode · {b.program ? (b.program.replace(/^0x/, '').length / 8) | 0 : 0} words</span>{b.program && <CopyButton value={b.program} label="copy" />}</div>
+      <pre className="scrollbox hex">{b.program || '—'}</pre>
     </div>
   )
 }
 
-function KV({ k, v, full, copy }) {
-  const value = v == null || v === '' ? '—' : String(v)
+function Program({ b, words }) {
+  if (!words.length) return <p className="muted">No program words.</p>
   return (
-    <div className="kv__row">
-      <span className="kv__k">{k}</span>
-      <span className="kv__vwrap">
-        <code className="mono kv__v" title={full || value}>{value}</code>
-        {copy && full ? <CopyButton value={String(full)} label="⧉" /> : null}
-      </span>
+    <div className="scrollbox asm">
+      {words.map((w, i) => {
+        const text = disasm(w), mnem = text.split(/\s/)[0]
+        return (
+          <div className="asm__row" key={i}>
+            <span className="asm__a">{(i * 4).toString(16).padStart(4, '0')}</span>
+            <span className="asm__w">{w.toString(16).padStart(8, '0')}</span>
+            <span className="asm__op"><b>{mnem}</b>{text.slice(mnem.length)}</span>
+          </div>
+        )
+      })}
     </div>
   )
 }
 
-// classic offset | hex bytes | ascii dump of a 0x hex string (capped).
+function Io({ b }) {
+  return (
+    <div className="io">
+      <div className="io__label">input (on DA)</div>
+      <pre className="scrollbox hex">{hexdump(b.input) || '∅ no input'}</pre>
+      <div className="io__label">output — public value (on DA)</div>
+      <pre className="scrollbox hex">{hexdump(b.output) || '— no output'}</pre>
+    </div>
+  )
+}
+
+/* ------------------------------ pieces ------------------------------ */
+
+function Fact({ k, v }) {
+  return <div className="fact"><div className="fact__k">{k}</div><div className="fact__v">{v ?? '—'}</div></div>
+}
+
+// Full, never-truncated hash with an inline copy control.
+function Hash({ k, v }) {
+  if (!v) return null
+  return (
+    <div className="hashrow">
+      <div className="hashrow__k">{k}</div>
+      <div className="hashrow__v"><code className="mono">{v}</code><CopyButton value={v} label="copy" /></div>
+    </div>
+  )
+}
+
 function hexdump(hex) {
   if (!hex) return ''
-  let s = hex.startsWith('0x') ? hex.slice(2) : hex
+  const s = hex.startsWith('0x') ? hex.slice(2) : hex
   if (!s.length) return ''
   const bytes = []
   for (let i = 0; i + 2 <= s.length && bytes.length < 512; i += 2) bytes.push(parseInt(s.slice(i, i + 2), 16))
   const lines = []
   for (let o = 0; o < bytes.length; o += 16) {
     const chunk = bytes.slice(o, o + 16)
-    const hexPart = chunk.map((x) => x.toString(16).padStart(2, '0')).join(' ').padEnd(47, ' ')
-    const ascii = chunk.map((x) => (x >= 32 && x < 127 ? String.fromCharCode(x) : '.')).join('')
-    lines.push(`${o.toString(16).padStart(6, '0')}  ${hexPart}  ${ascii}`)
+    const hp = chunk.map((x) => x.toString(16).padStart(2, '0')).join(' ').padEnd(47, ' ')
+    const asc = chunk.map((x) => (x >= 32 && x < 127 ? String.fromCharCode(x) : '.')).join('')
+    lines.push(`${o.toString(16).padStart(6, '0')}  ${hp}  ${asc}`)
   }
-  if (bytes.length >= 512) lines.push('… (truncated)')
+  if (bytes.length >= 512) lines.push('… truncated')
   return lines.join('\n')
 }

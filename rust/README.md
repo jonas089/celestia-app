@@ -91,6 +91,23 @@ explorer (`test/accidental-computer/dashboard`). `programs/txproc.rs` is the sin
 deployed contract (a signed balance-transfer STF), shown in the explorer with its
 source and compiled rv32 bytecode.
 
+## Performance (measured, M3 Max / 64 GB)
+
+The Expander GKR prover is **single-core per proof** (its parallelism is
+data-parallel over MPI ranks × 8 SIMD lanes, each replicating the circuit in
+memory — it does not speed up one proof). Full-device throughput therefore comes
+from running independent provers in parallel (`bench_parallel.sh`):
+
+- Per core: **~2.2 tx/s** (a 32-tx block warm-proves in ~14.6 s), ~25 GB resident.
+- Device peak: **~11 tx/s** at ~10 concurrent provers (16-tx blocks).
+
+The ceiling is **memory-capacity bound, not core-bound**: each proof's circuit is
+~15–25 GB, so only ~10 fit in 64 GB before the OS compresses them and
+decompression starves the cores. Levers: more RAM scales ~linearly; the
+arithmetization rewrite (lookups + offline memory + tower field) shrinks the
+per-cycle gate count (~850k → ~1k), cutting both memory/proof and prove time —
+compounding to orders of magnitude. See `bench_parallel.sh` to reproduce.
+
 ## Running it
 
 `make start` builds the celestia-app + rollup images and launches the full stack

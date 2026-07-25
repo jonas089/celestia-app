@@ -2,6 +2,19 @@
 // data — the rv32 disassembler simply decodes the on-DA program words so the
 // explorer can show what the VM actually executed.
 
+import { useEffect, useState } from 'react'
+
+// A ticking clock hook: re-renders every `ms` so countdowns / elapsed timers
+// stay live and smooth without touching the polling loop.
+export function useNow(ms = 250) {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), ms)
+    return () => clearInterval(t)
+  }, [ms])
+  return now
+}
+
 export function truncHex(hex, head = 10, tail = 6) {
   if (!hex) return ''
   const s = String(hex)
