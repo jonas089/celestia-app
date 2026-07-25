@@ -45,3 +45,18 @@ talis-setup/
 # Swagger generation artifacts
 tmp-swagger-gen/
 docs/swagger/swagger.json
+# accidental-computer: rust build artifacts (~5.7GB — never commit)
+rust/target/
+rust/crates/*/target/
+# accidental-computer: stray compiled binaries
+/api
+/fieldiso
+test/accidental-computer/api/api
+# accidental-computer: node identity / engine-JWT secrets (regenerate locally)
+test/accidental-computer/testnet/ev-node/config/signer.json
+test/accidental-computer/testnet/ev-node/config/passphrase.txt
+test/accidental-computer/testnet/ev-node/config/jwt.hex
+test/accidental-computer/testnet/reth/jwt.hex
+
+# accidental-computer local runtime artifacts
+test/accidental-computer/.run/

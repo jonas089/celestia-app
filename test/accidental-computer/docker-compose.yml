@@ -1,0 +1,246 @@
+# Self-contained local testing environment for celestia-app + the "accidental
+# rv32i computer" rollup, wired for FIBRE-REUSE DA.
+#
+#   * celestia-app image is BUILT FROM THIS REPO'S SOURCE (see Makefile `start`,
+#     which builds docker/standalone.Dockerfile and tags it
+#     `celestia-app-standalone:accidental-local`) so our modified pkg/rsema1d is
+#     live. The SAME image also ships the `fibre` server binary.
+#   * The rollup is the rv32-rollup (rust/crates/rv32-rollup) running in
+#     FIBRE-REUSE DA mode: it PREPARES each block's rsema1d input square (zero
+#     prover-side RS-encode), execs the `rv32-fibre-upload` tool which encodes the
+#     square ONCE, uploads it to the fibre server, and records the commitment
+#     on-chain via MsgPayForFibre, then OPENS the GKR proof against that exact
+#     on-chain commitment.
+#   * A `submitter` service injects sample rv32i programs on a loop so blocks
+#     are non-empty and real GKR proofs flow to the dashboard.
+#
+# Topology (start order): celestia-init -> celestia-validator (healthy, block>=1)
+#   -> fibre-server (serving :7980) + fibre-init (set-host + deposit-to-escrow)
+#   -> rv32-rollup (fibre mode) -> submitter.
+
+name: accidental-computer
+
+services:
+  celestia-init:
+    image: ${CELESTIA_APP_IMAGE:-celestia-app-standalone:accidental-local}
+    container_name: acc-celestia-init
+    entrypoint: /scripts/init.sh
+    volumes:
+      - ./testnet/celestia-app/init.sh:/scripts/init.sh:ro
+      - celestia-app:/home/celestia/.celestia-app
+    restart: "no"
+    networks:
+      - accidental-net
+
+  celestia-validator:
+    image: ${CELESTIA_APP_IMAGE:-celestia-app-standalone:accidental-local}
+    container_name: acc-celestia-validator
+    ports:
+      - "26656:26656"
+      - "26657:26657"
+      - "1317:1317"
+      - "9090:9090"
+      # priv-validator gRPC, used by the fibre server to sign payment promises.
+      - "26669:26669"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'bh=$(curl -sf http://localhost:26657/status | jq -r ''.result.sync_info.latest_block_height''); if [ "$$bh" -gt 1 ]; then exit 0; else exit 1; fi',
+        ]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 30
+    volumes:
+      - celestia-app:/home/celestia/.celestia-app
+    command: >
+      start --force-no-bbr --grpc.enable
+    depends_on:
+      celestia-init:
+        condition: service_completed_successfully
+    networks:
+      - accidental-net
+
+  # NEW: the standalone fibre server. Waits until the validator has produced a
+  # block (else it exits "celestia-app is not ready"), then serves shard uploads
+  # on :7980, reading chain state over the app gRPC (:9090) and signing payment
+  # promises via the validator's priv-validator gRPC (:26669). Uses the same
+  # celestia-app image (it ships /bin/fibre).
+  fibre-server:
+    image: ${CELESTIA_APP_IMAGE:-celestia-app-standalone:accidental-local}
+    container_name: acc-fibre-server
+    ports:
+      - "7980:7980"
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -eu
+        echo "fibre-server: waiting for validator block height >= 1 ..."
+        until h=$$(curl -sf http://celestia-validator:26657/status | jq -r '.result.sync_info.latest_block_height' 2>/dev/null) && [ -n "$$h" ] && [ "$$h" != "null" ] && [ "$$h" -ge 1 ] 2>/dev/null; do
+          sleep 2
+        done
+        echo "fibre-server: chain ready at height $$h; starting fibre"
+        exec fibre start \
+          --home /tmp/fibre-home \
+          --app-grpc-address celestia-validator:9090 \
+          --signer-grpc-address celestia-validator:26669 \
+          --server-listen-address 0.0.0.0:7980
+    healthcheck:
+      # /dev/tcp is a bash-only feature; CMD-SHELL uses /bin/sh, so invoke bash
+      # explicitly (the image ships /bin/bash) to TCP-probe the gRPC listener.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/7980"]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 30
+    depends_on:
+      celestia-validator:
+        condition: service_healthy
+    networks:
+      - accidental-net
+
+  # NEW one-shot: register the fibre provider host (the docker-network address
+  # clients dial) and fund the fibre escrow, both signed by the `validator` key
+  # on the shared chain-home volume. rv32-rollup waits for this to complete.
+  fibre-init:
+    image: ${CELESTIA_APP_IMAGE:-celestia-app-standalone:accidental-local}
+    container_name: acc-fibre-init
+    restart: "no"
+    volumes:
+      - celestia-app:/home/celestia/.celestia-app
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -eu
+        NODE=tcp://celestia-validator:26657
+        CHAIN=celestia-zkevm
+        HOME_DIR=/home/celestia/.celestia-app
+        COMMON="--home $$HOME_DIR --keyring-backend test --chain-id $$CHAIN --node $$NODE --fees 5000utia --yes --output json"
+
+        echo "fibre-init: waiting for validator RPC (height>=1) ..."
+        until h=$$(curl -sf http://celestia-validator:26657/status | jq -r '.result.sync_info.latest_block_height' 2>/dev/null) && [ -n "$$h" ] && [ "$$h" != "null" ] && [ "$$h" -ge 1 ] 2>/dev/null; do
+          sleep 2
+        done
+        echo "fibre-init: chain up at height $$h"
+
+        wait_tx() {
+          hash=$$1
+          for i in $$(seq 1 40); do
+            code=$$(celestia-appd q tx "$$hash" --node $$NODE --output json 2>/dev/null | jq -r '.code' 2>/dev/null || echo "")
+            if [ -n "$$code" ] && [ "$$code" != "null" ]; then
+              if [ "$$code" = "0" ]; then
+                echo "fibre-init: tx $$hash committed (code 0)"
+                return 0
+              fi
+              echo "fibre-init: tx $$hash FAILED on-chain (code $$code)" >&2
+              celestia-appd q tx "$$hash" --node $$NODE --output json 2>/dev/null | jq -r '.raw_log' >&2 || true
+              return 1
+            fi
+            sleep 2
+          done
+          echo "fibre-init: tx $$hash not committed in time" >&2
+          return 1
+        }
+
+        echo "fibre-init: registering fibre provider host fibre-server:7980"
+        out=$$(celestia-appd tx valaddr set-host fibre-server:7980 --from validator $$COMMON)
+        echo "$$out"
+        wait_tx "$$(echo "$$out" | jq -r '.txhash')"
+
+        echo "fibre-init: depositing 1000000000utia to fibre escrow"
+        out=$$(celestia-appd tx fibre deposit-to-escrow 1000000000utia --from validator $$COMMON)
+        echo "$$out"
+        wait_tx "$$(echo "$$out" | jq -r '.txhash')"
+
+        echo "fibre-init: verifying provider registration"
+        celestia-appd query valaddr providers --node $$NODE --output json || true
+        echo "fibre-init: done"
+    depends_on:
+      celestia-validator:
+        condition: service_healthy
+    networks:
+      - accidental-net
+
+  # The accidental rv32i computer in FIBRE-REUSE DA mode. Built from the
+  # celestia-app repo root (needs pkg/rsema1d/cshim -> librsema1d.so, the Rust
+  # prover + rollup, AND tools/rv32-fibre-upload). Each block: PREPARE (no
+  # encode) -> exec rv32-fibre-upload (encode once + upload to fibre-server +
+  # settle MsgPayForFibre) -> OPEN the GKR proof against the on-chain commitment.
+  # daHeight is the REAL fibre settlement height. Mounts the shared chain-home
+  # volume read-only so the tool can sign as `validator`.
+  rv32-rollup:
+    build:
+      context: ../..
+      dockerfile: docker/rv32-rollup.Dockerfile
+    image: rv32-rollup:accidental-local
+    container_name: acc-rv32-rollup
+    ports:
+      - "8545:8545"
+    environment:
+      - RV32_ADDR=0.0.0.0:8545
+      - RV32_BLOCK_SECS=60
+      # Interpreter unroll depth for the tx contract: ~38 cycles/tx, so 256 steps
+      # covers a batch of up to ~6 transfers. Drives the circuit size (prove time).
+      - RV32_STEPS=256
+      # 10-byte (20-hex) Celestia namespace ID: 3 zero bytes + "rv32rup". The
+      # fibre uploader tool requires a v0 namespace ID (NamespaceVersionZeroIDSize
+      # = 10 bytes).
+      - RV32_NAMESPACE=00000072763332727570
+      # FIBRE-REUSE DA mode (enabled iff FIBRE_UPLOAD_BIN is set).
+      - FIBRE_UPLOAD_BIN=/usr/local/bin/rv32-fibre-upload
+      - FIBRE_GRPC_ADDR=celestia-validator:9090
+      - FIBRE_KEY_NAME=validator
+      - FIBRE_HOME=/celestia-home
+      - FIBRE_CHAIN_ID=celestia-zkevm
+      - FIBRE_KEYRING_BACKEND=test
+    volumes:
+      # Shared chain-home (read-only): the tool reads /celestia-home/keyring-test/
+      # to sign MsgPayForFibre as `validator`.
+      - celestia-app:/celestia-home:ro
+    depends_on:
+      fibre-init:
+        condition: service_completed_successfully
+      fibre-server:
+        condition: service_healthy
+    networks:
+      - accidental-net
+
+  # Drives the transaction rollup: deploys the genesis balance state (block 1),
+  # then submits a signed-transfer batch each interval. Reuses the rollup image
+  # (`emit-sample genesis` / `emit-sample txbatch N` print ready-to-submit JSON).
+  submitter:
+    image: rv32-rollup:accidental-local
+    container_name: acc-rv32-submitter
+    restart: on-failure
+    depends_on:
+      rv32-rollup:
+        condition: service_started
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        RPC="http://rv32-rollup:8545"
+        submit() {
+          body="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"rv32_submit\",\"params\":[$$1]}"
+          curl -s -X POST "$$RPC" -H 'Content-Type: application/json' -d "$$body" >/dev/null || true
+        }
+        echo "submitter: waiting for rollup RPC at $$RPC ..."
+        until curl -s -o /dev/null "$$RPC"; do sleep 2; done
+        echo "submitter: submitting a signed-transfer batch (genesis-seeded) every 60s"
+        while true; do
+          submit "$$(rv32-rollup emit-sample txbatch 4)"
+          sleep 60
+        done
+    networks:
+      - accidental-net
+
+volumes:
+  celestia-app:
+
+networks:
+  accidental-net:
+    driver: bridge

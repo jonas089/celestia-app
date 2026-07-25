@@ -10,6 +10,11 @@ import (
 
 const (
 	BlobVersionZero = uint32(0)
+	// BlobVersionOne is the rv32 GKR square blob version. Its erasure shape
+	// (K=N, one-Leopard-chunk rows, no blob header) matches an rsema1d square,
+	// so a square committed by the rv32 GKR prover can be settled on-chain via
+	// MsgPayForFibre with this version.
+	BlobVersionOne = uint32(1)
 )
 
 // ValidateBasic performs stateless validation for MsgDepositToEscrow
@@ -144,8 +149,10 @@ func (msg *MsgUpdateFibreParams) ValidateBasic() error {
 }
 
 func validateBlobVersion(blobVersion uint32) error {
-	if blobVersion != BlobVersionZero {
+	switch blobVersion {
+	case BlobVersionZero, BlobVersionOne:
+		return nil
+	default:
 		return errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "unsupported blob version: %d", blobVersion)
 	}
-	return nil
 }

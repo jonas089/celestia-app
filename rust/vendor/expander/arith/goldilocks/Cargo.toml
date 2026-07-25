@@ -1,0 +1,19 @@
+[package]
+name = "goldilocks"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arith = { path = ".." }
+serdes = { path = "../../serdes" }
+
+ark-std.workspace = true
+ethnum.workspace = true
+rand.workspace = true
+
+[[bench]]
+name = "goldilocks"
+harness = false
+
+[dev-dependencies]
+criterion = "0.5"

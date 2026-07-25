@@ -303,6 +303,83 @@ publish-ghcr-docker:
 docker-publish: publish-ghcr-docker
 .PHONY: docker-publish
 
+# Local self-contained accidental-computer testing environment (test/accidental-computer).
+ACCIDENTAL_COMPOSE := test/accidental-computer/docker-compose.yml
+ACCIDENTAL_IMAGE := celestia-app-standalone:accidental-local
+ACCIDENTAL_RUNDIR := $(CURDIR)/test/accidental-computer/.run
+# JSON-RPC endpoint the dashboard API reads accProof records from: the
+# rv32-rollup's rv32_submit / accProof_listBlockProofs / accProof_getBlockProof.
+ACCPROOF_RPC ?= http://localhost:8545
+# The single rollup namespace the dashboard surfaces (matches the rv32-rollup's
+# accProof_listBlockProofs rollupNS).
+ROLLUP_NS ?= rv32-rollup
+
+# The rollup is the NEW rv32-rollup (the accidental rv32i computer). Its image is
+# built from THIS celestia-app repo root: the build needs both the Go rsema1d DA
+# encoder (pkg/rsema1d/cshim -> librsema1d.so) and the Rust prover + rollup
+# (rust/crates/rv32-rollup); the ECC frontend is a remote cargo git dep.
+RV32_ROLLUP_IMAGE := rv32-rollup:accidental-local
+RV32_ROLLUP_DOCKERFILE := docker/rv32-rollup.Dockerfile
+
+## start: Build celestia-app + the rv32-rollup (accidental rv32i computer) and launch the local testing env with sample-program injection. Requires Docker.
+start:
+	@echo "--> Building local celestia-app standalone image ($(ACCIDENTAL_IMAGE)) from current branch (ships celestia-appd + fibre)"
+	$(DOCKER) build -t $(ACCIDENTAL_IMAGE) -f docker/standalone.Dockerfile .
+	@echo "--> Building rv32-rollup image ($(RV32_ROLLUP_IMAGE)) from $(RV32_ROLLUP_DOCKERFILE) (ships rv32-rollup + rv32-fibre-upload)"
+	$(DOCKER) build -f $(RV32_ROLLUP_DOCKERFILE) -t $(RV32_ROLLUP_IMAGE) .
+	@echo "--> Starting accidental-computer stack (validator + fibre-server + fibre-init + rv32-rollup [fibre-reuse DA] + submitter)"
+	CELESTIA_APP_IMAGE=$(ACCIDENTAL_IMAGE) \
+		$(DOCKER) compose -f $(ACCIDENTAL_COMPOSE) up -d
+	@echo "--> Stack up. rv32-rollup RPC: http://localhost:8545 | celestia-app RPC: http://localhost:26657 | fibre server: localhost:7980"
+	@echo "--> The submitter service is injecting sample rv32i programs so rollup blocks are non-empty."
+	@$(MAKE) ui-up
+.PHONY: start
+
+## stop: Tear down the local reth rollup testing env and remove its volumes. Requires Docker.
+stop:
+	@echo "--> Stopping accidental-computer stack and removing volumes"
+	@$(MAKE) ui-down
+	$(DOCKER) compose -f $(ACCIDENTAL_COMPOSE) down -v
+.PHONY: stop
+
+## ui-up: Launch the dashboard API (:8088) + React UI (:3000) in the background (invoked by `start`).
+ui-up:
+	@mkdir -p $(ACCIDENTAL_RUNDIR)
+	@echo "--> Starting dashboard API on http://localhost:8088 (ACCPROOF_RPC=$(ACCPROOF_RPC))"
+	@ACCPROOF_RPC=$(ACCPROOF_RPC) ROLLUP_NS=$(ROLLUP_NS) nohup go run ./test/accidental-computer/api > $(ACCIDENTAL_RUNDIR)/api.log 2>&1 & echo $$! > $(ACCIDENTAL_RUNDIR)/api.pid
+	@echo "--> Starting dashboard UI on http://localhost:3000"
+	@cd test/accidental-computer/dashboard && (pnpm install >/dev/null 2>&1 || true); nohup pnpm dev > $(ACCIDENTAL_RUNDIR)/dashboard.log 2>&1 & echo $$! > $(ACCIDENTAL_RUNDIR)/dashboard.pid
+	@sleep 1
+	@echo "--> UI: http://localhost:3000  |  API: http://localhost:8088  (logs: $(ACCIDENTAL_RUNDIR))"
+.PHONY: ui-up
+
+## ui-down: Stop the background dashboard API + UI (invoked by `stop`).
+ui-down:
+	@echo "--> Stopping dashboard UI + API"
+	-@[ -f $(ACCIDENTAL_RUNDIR)/dashboard.pid ] && kill $$(cat $(ACCIDENTAL_RUNDIR)/dashboard.pid) 2>/dev/null || true
+	-@[ -f $(ACCIDENTAL_RUNDIR)/api.pid ] && kill $$(cat $(ACCIDENTAL_RUNDIR)/api.pid) 2>/dev/null || true
+	-@pkill -f "accidental-computer/api" 2>/dev/null || true
+	-@pkill -f "vite" 2>/dev/null || true
+	@# `go run` compiles to a temp binary whose cmdline does not match the pattern
+	@# above, so free the API (:8088) and UI (:3000) ports directly as a fallback.
+	-@lsof -ti tcp:8088 2>/dev/null | xargs kill 2>/dev/null || true
+	-@lsof -ti tcp:3000 2>/dev/null | xargs kill 2>/dev/null || true
+	-@rm -f $(ACCIDENTAL_RUNDIR)/api.pid $(ACCIDENTAL_RUNDIR)/dashboard.pid
+.PHONY: ui-down
+
+
+## dashboard-api: Run the accidental-computer commitment/verification API server on :8088 (serves real rsema1d commitments + verifications).
+dashboard-api:
+	@echo "--> Starting accidental-computer API on http://localhost:8088"
+	go run ./test/accidental-computer/api
+.PHONY: dashboard-api
+
+## dashboard: Run the accidental-computer React+Vite dashboard on http://localhost:3000 (needs dashboard-api running on :8088).
+dashboard:
+	@echo "--> Starting dashboard on http://localhost:3000 (API expected on :8088)"
+	cd test/accidental-computer/dashboard && pnpm install && pnpm dev
+.PHONY: dashboard
+
 ## lint: Run all linters; golangci-lint, markdownlint, hadolint, yamllint.
 lint:
 	@echo "--> Running golangci-lint"

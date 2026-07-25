@@ -1,0 +1,47 @@
+[package]
+name = "bin"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arith = { path = "../arith" }
+babybear = { path = "../arith/babybear" }
+config_macros = { path = "../config_macros" }
+circuit = { path = "../circuit" }
+gf2 = { path = "../arith/gf2" }
+gf2_128 = { path = "../arith/gf2_128" }
+gkr = { path = "../gkr" }
+gkr_engine = { path = "../gkr_engine" }
+gkr_hashers = { path = "../hasher" }
+goldilocks = { path = "../arith/goldilocks" }
+mersenne31 = { path = "../arith/mersenne31" }
+poly_commit = { path = "../poly_commit" }
+polynomials = { path = "../arith/polynomials" }
+serdes = { path = "../serdes" }
+sumcheck = { path = "../sumcheck" }
+transcript = { path = "../transcript" }
+utils = { path = "../utils" }
+
+bytes.workspace = true
+chrono.workspace = true
+clap.workspace = true
+log.workspace = true
+mpi.workspace = true
+tokio.workspace = true
+warp.workspace = true
+
+[[bin]]
+name = "dev-setup"
+path = "src/dev_setup.rs"
+
+[[bin]]
+name = "expander-exec"
+path = "src/exec.rs"
+
+[[bin]]
+name = "gkr"
+path = "src/main.rs"
+
+[[bin]]
+name = "gkr-mpi"
+path = "src/main_mpi.rs"
